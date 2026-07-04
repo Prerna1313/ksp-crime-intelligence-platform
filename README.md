@@ -1,3 +1,3 @@
 # KSP Crime Intelligence Platform
 
-AI-powered investigative intelligence platform.
+AI-powered investigative intelligence platform. 
