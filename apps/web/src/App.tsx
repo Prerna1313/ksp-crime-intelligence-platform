@@ -1,11 +1,31 @@
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useCallback } from 'react';
 import { CREST_SRC } from './assets/crest';
+import {
+  api,
+  clearAuthTokens,
+  getStoredToken,
+  storeAuthTokens,
+  streamConversationMessage,
+  type AlertItem,
+  type ApiStatus,
+  type ApiUser,
+  type AuditEvent,
+  type CaseItem,
+  type ChatMessage,
+  type EntityDetail,
+  type Hotspot,
+  type MapIncident,
+  type NetworkGraph,
+  type ReportItem,
+  type SearchResultItem,
+  type TimelineEvent,
+} from './api';
 import './App.css';
 
 /* ============================================================
    ICONS — consistent stroke system, 24px grid, 1.75 stroke
    ============================================================ */
-export const ICONS = {
+const ICONS = {
   search: <><circle cx="10.5" cy="10.5" r="6.5"/><line x1="20.5" y1="20.5" x2="15.3" y2="15.3"/></>,
   bell: <><path d="M6 16.5v-5a6 6 0 1 1 12 0v5l2 2H4l2-2z"/><path d="M10 20a2 2 0 0 0 4 0"/></>,
   user: <><circle cx="12" cy="8" r="4"/><path d="M4 20.5c0-4.2 4-6.5 8-6.5s8 2.3 8 6.5"/></>,
@@ -180,12 +200,290 @@ function Kv({ rows }: { rows: [string, React.ReactNode][] }) {
   );
 }
 
-function PlaceholderCanvas({ iconName, label, note, height = '360px' }: { iconName: keyof typeof ICONS; label: string; note?: string; height?: string }) {
+function NetworkCanvas({
+  graph,
+  query = '',
+  zoom = 100,
+  selectedNodeId,
+  onSelect,
+  height = '360px',
+  compact = false,
+}: {
+  graph: NetworkGraph;
+  query?: string;
+  zoom?: number;
+  selectedNodeId?: string;
+  onSelect?: (id: string) => void;
+  height?: string;
+  compact?: boolean;
+}) {
+  const activeGraph = graph.nodes.length ? graph : FALLBACK_GRAPH;
+  const normalizedQuery = query.trim().toLowerCase();
+  const matchedIds = new Set(
+    activeGraph.nodes
+      .filter((node) => !normalizedQuery || `${node.data.label} ${node.data.type || ''}`.toLowerCase().includes(normalizedQuery))
+      .map((node) => node.data.id)
+  );
+  const relatedIds = new Set(matchedIds);
+  if (normalizedQuery) {
+    activeGraph.edges.forEach((edge) => {
+      if (matchedIds.has(edge.data.source) || matchedIds.has(edge.data.target)) {
+        relatedIds.add(edge.data.source);
+        relatedIds.add(edge.data.target);
+      }
+    });
+  }
+  const nodes = activeGraph.nodes.filter((node) => !normalizedQuery || relatedIds.has(node.data.id));
+  const nodeIds = new Set(nodes.map((node) => node.data.id));
+  const edges = activeGraph.edges.filter((edge) => nodeIds.has(edge.data.source) && nodeIds.has(edge.data.target));
+  const center = { x: 450, y: compact ? 115 : 205 };
+  const radiusX = compact ? 260 : 310;
+  const radiusY = compact ? 58 : 135;
+  const scale = zoom / 100;
+  const positions = nodes.reduce<Record<string, { x: number; y: number }>>((acc, node, index) => {
+    if (node.data.type === 'CASE' && !compact) {
+      acc[node.data.id] = center;
+      return acc;
+    }
+    const ringIndex = activeGraph.nodes.some((item) => item.data.type === 'CASE') && !compact ? index - 1 : index;
+    const total = Math.max(1, nodes.filter((item) => item.data.type !== 'CASE' || compact).length);
+    const angle = (Math.PI * 2 * Math.max(0, ringIndex)) / total - Math.PI / 2;
+    acc[node.data.id] = {
+      x: center.x + Math.cos(angle) * radiusX * scale,
+      y: center.y + Math.sin(angle) * radiusY * scale,
+    };
+    return acc;
+  }, {});
+
+  const nodeTone = (type?: string) => {
+    const normalized = (type || '').toUpperCase();
+    if (normalized.includes('CASE')) return 'case';
+    if (normalized.includes('PHONE') || normalized.includes('VEHICLE')) return 'object';
+    return 'person';
+  };
+
+  const caseNode = nodes.find((node) => node.data.type === 'CASE');
+  const caseNodeId = caseNode ? caseNode.data.id : null;
+
   return (
-    <div className="placeholder-canvas" style={{ height }}>
-      <div className="pc-icon"><Ic name={iconName} cls="ic-lg" /></div>
-      <div className="pc-label">{label}</div>
-      {note && <div className="pc-note">{note}</div>}
+    <div className={`viz-canvas network-viz ${compact ? 'compact' : ''}`} style={{ height }}>
+      <svg viewBox={`0 0 900 ${compact ? 230 : 430}`} role="img" aria-label="Network graph">
+        <defs>
+          <marker id="edge-arrow" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto">
+            <path d="M0,0 L6,3 L0,6 Z" />
+          </marker>
+        </defs>
+        {edges.map((edge) => {
+          const source = positions[edge.data.source];
+          const target = positions[edge.data.target];
+          if (!source || !target) return null;
+
+          const isSourceCase = edge.data.source === caseNodeId;
+          const isTargetCase = edge.data.target === caseNodeId;
+          const isCircularEdge = !isSourceCase && !isTargetCase;
+
+          let pathD = '';
+          let labelX = 0;
+          let labelY = 0;
+
+          const midX = (source.x + target.x) / 2;
+          const midY = (source.y + target.y) / 2;
+
+          if (isCircularEdge && !compact) {
+            const dx = midX - center.x;
+            const dy = midY - center.y;
+            const len = Math.sqrt(dx * dx + dy * dy) || 1;
+            const ctrlX = midX + (dx / len) * 45;
+            const ctrlY = midY + (dy / len) * 45;
+            pathD = `M ${source.x} ${source.y} Q ${ctrlX} ${ctrlY} ${target.x} ${target.y}`;
+            labelX = 0.5 * midX + 0.5 * ctrlX;
+            labelY = 0.5 * midY + 0.5 * ctrlY;
+          } else {
+            pathD = `M ${source.x} ${source.y} L ${target.x} ${target.y}`;
+            labelX = midX;
+            labelY = midY;
+          }
+
+          return (
+            <g key={edge.data.id}>
+              <path className="graph-edge" d={pathD} markerEnd="url(#edge-arrow)" fill="none" />
+              {!compact && (
+                <text className="edge-label" x={labelX} y={labelY}>
+                  {edge.data.label || 'RELATED'}
+                </text>
+              )}
+            </g>
+          );
+        })}
+        {nodes.map((node) => {
+          const position = positions[node.data.id] || center;
+          const isSelected = selectedNodeId === node.data.id;
+
+          let textAnchor: 'start' | 'middle' | 'end' = 'middle';
+          let labelX = position.x;
+          let labelY = position.y;
+
+          if (node.data.type === 'CASE' && !compact) {
+            labelY = position.y + 54;
+          } else {
+            const dx = position.x - center.x;
+            const dy = position.y - center.y;
+            const len = Math.sqrt(dx * dx + dy * dy) || 1;
+            const ux = dx / len;
+            const uy = dy / len;
+            const offset = (compact ? 24 : 34) + 12;
+            labelX = position.x + ux * offset;
+            labelY = position.y + uy * offset;
+
+            if (Math.abs(ux) > 0.6) {
+              textAnchor = ux > 0 ? 'start' : 'end';
+              labelY = position.y + 4;
+            } else {
+              textAnchor = 'middle';
+              if (uy < 0) {
+                labelY = position.y - offset;
+              } else {
+                labelY = position.y + offset;
+              }
+            }
+          }
+
+          return (
+            <g
+              className={`graph-node ${nodeTone(node.data.type)} ${isSelected ? 'selected' : ''}`}
+              key={node.data.id}
+              onClick={() => onSelect?.(node.data.id)}
+              tabIndex={0}
+              role="button"
+            >
+              <circle cx={position.x} cy={position.y} r={compact ? 24 : 34} />
+              <text className="node-label" style={{ textAnchor }} x={labelX} y={labelY}>{node.data.label}</text>
+              {!compact && <text className="node-type" x={position.x} y={position.y + 5}>{node.data.type || 'NODE'}</text>}
+            </g>
+          );
+        })}
+        {nodes.length === 0 && <text className="empty-viz-text" x="450" y="210">No matching nodes</text>}
+      </svg>
+      {!compact && (
+        <div className="viz-status">
+          {nodes.length} nodes · {edges.length} links · Zoom {zoom}%
+        </div>
+      )}
+    </div>
+  );
+}
+
+function TimelineCanvas({ events, zoom = 100, height = '240px', compact = false }: { events: TimelineEvent[]; zoom?: number; height?: string; compact?: boolean }) {
+  const activeEvents = (events.length ? events : FALLBACK_TIMELINE)
+    .slice()
+    .sort((a, b) => new Date(a.event_date).getTime() - new Date(b.event_date).getTime());
+  const viewHeight = compact ? 170 : 250;
+  const startX = compact ? 80 : 90;
+  const endX = compact ? 820 : 815;
+  const axisY = compact ? 78 : 118;
+  const available = (endX - startX) * (zoom / 100);
+
+  return (
+    <div className={`viz-canvas timeline-viz ${compact ? 'compact' : ''}`} style={{ height }}>
+      <svg viewBox={`0 0 900 ${viewHeight}`} role="img" aria-label="Timeline">
+        <line className="timeline-axis" x1={startX} y1={axisY} x2={Math.min(850, startX + available)} y2={axisY} />
+        {activeEvents.map((event, index) => {
+          const x = activeEvents.length === 1 ? startX : startX + ((endX - startX) * index) / (activeEvents.length - 1);
+          const isConflict = !!event.has_conflict;
+          return (
+            <g className={`timeline-event ${isConflict ? 'conflict' : ''}`} key={event.id}>
+              <line className="timeline-stem" x1={x} y1={axisY - 28} x2={x} y2={axisY + 28} />
+              <circle cx={x} cy={axisY} r={compact ? 8 : 11} />
+              <text className="timeline-date" x={x} y={axisY - 42}>{shortDate(event.event_date)}</text>
+              {!compact && (
+                <>
+                  <rect className="timeline-card" x={Math.max(18, Math.min(670, x - 92))} y={axisY + 38} width="190" height="58" rx="6" />
+                  <text className="timeline-desc" x={Math.max(36, Math.min(688, x - 74))} y={axisY + 62}>{event.description.slice(0, 30)}</text>
+                  <text className="timeline-type" x={Math.max(36, Math.min(688, x - 74))} y={axisY + 82}>{event.event_type.replace(/_/g, ' ')}</text>
+                </>
+              )}
+            </g>
+          );
+        })}
+      </svg>
+      {!compact && <div className="viz-status">{activeEvents.length} events · Zoom {zoom}%</div>}
+    </div>
+  );
+}
+
+function CrimeMapCanvas({
+  incidents,
+  cases,
+  hotspots,
+  layers,
+  typeFilter,
+  statusFilter,
+  height = '420px',
+}: {
+  incidents: MapIncident[];
+  cases: CaseItem[];
+  hotspots: Hotspot[];
+  layers: { incidents: boolean; hotspots: boolean; boundaries: boolean };
+  typeFilter: string;
+  statusFilter: string;
+  height?: string;
+}) {
+  const fallbackIncidents: MapIncident[] = cases.map((item, index) => ({
+    id: item.id,
+    case_number: item.case_number,
+    type: item.case_type,
+    status: item.status,
+    lat: [12.9352, 13.3409, 12.2958, 12.9698][index % 4],
+    lng: [77.6245, 77.1010, 76.6394, 77.7500][index % 4],
+  }));
+  const activeIncidents = (incidents.length ? incidents : fallbackIncidents)
+    .filter((incident) => (!typeFilter || incident.type === typeFilter) && (!statusFilter || incident.status === statusFilter));
+  const activeHotspots = hotspots.length ? hotspots : [{ lat: 12.9698, lng: 77.7500, intensity: 0.82 }];
+  const project = (lat: number, lng: number, index = 0) => {
+    const minLat = 12.05;
+    const maxLat = 13.55;
+    const minLng = 76.25;
+    const maxLng = 78.25;
+    const x = 90 + ((lng - minLng) / (maxLng - minLng)) * 700 + (index % 3) * 14;
+    const y = 385 - ((lat - minLat) / (maxLat - minLat)) * 310 + (index % 2) * 12;
+    return {
+      x: Math.max(55, Math.min(850, x)),
+      y: Math.max(55, Math.min(395, y)),
+    };
+  };
+
+  return (
+    <div className="viz-canvas map-viz" style={{ height }}>
+      <svg viewBox="0 0 900 440" role="img" aria-label="Crime map">
+        <rect className="map-base" x="34" y="28" width="832" height="380" rx="8" />
+        <path className="map-road major" d="M70 335 C220 280 310 320 450 235 S690 135 835 92" />
+        <path className="map-road" d="M105 112 C220 172 322 160 430 205 S640 285 790 248" />
+        <path className="map-road" d="M160 378 C250 260 275 188 330 55" />
+        <path className="map-road" d="M575 390 C560 290 600 188 740 52" />
+        {layers.boundaries && (
+          <>
+            <path className="station-boundary" d="M95 95 L354 60 L438 190 L318 350 L104 305 Z" />
+            <path className="station-boundary" d="M438 190 L690 83 L826 152 L790 342 L558 360 Z" />
+          </>
+        )}
+        {layers.hotspots && activeHotspots.map((hotspot, index) => {
+          const position = project(hotspot.lat, hotspot.lng, index);
+          return <circle className="hotspot-ring" key={`${hotspot.lat}-${hotspot.lng}-${index}`} cx={position.x} cy={position.y} r={50 + hotspot.intensity * 36} />;
+        })}
+        {layers.incidents && activeIncidents.map((incident, index) => {
+          const position = project(incident.lat, incident.lng, index);
+          return (
+            <g className={`map-marker ${incident.status === 'ACTIVE' ? 'active' : ''}`} key={incident.id}>
+              <circle cx={position.x} cy={position.y} r="13" />
+              <text x={position.x} y={position.y + 35}>{incident.case_number}</text>
+            </g>
+          );
+        })}
+        {!layers.incidents && !layers.hotspots && <text className="empty-viz-text" x="450" y="220">All map layers are off</text>}
+      </svg>
+      <div className="viz-status">
+        {layers.incidents ? activeIncidents.length : 0} incident markers · {layers.hotspots ? activeHotspots.length : 0} hotspot overlays
+      </div>
     </div>
   );
 }
@@ -223,7 +521,6 @@ interface ScreenConfig {
 }
 
 const SCREENS: ScreenConfig[] = [
-  { key: 'legend', navLabel: 'Design System', shell: false },
   { key: 'login', navLabel: 'Login', shell: false },
   { key: 'workspace', navLabel: 'Investigation Workspace', shell: true, title: 'Investigation Workspace', activeNav: 'workspace', caseLabel: 'CR-2024-04471', hideHead: true },
   { key: 'search', navLabel: 'Search', shell: true, title: 'Search', breadcrumb: ['Search'], activeNav: 'search', caseLabel: null },
@@ -232,15 +529,135 @@ const SCREENS: ScreenConfig[] = [
   { key: 'network', navLabel: 'Network Explorer', shell: true, title: 'Network Explorer', breadcrumb: ['Network Explorer', 'Context: CR-2024-04471'], activeNav: 'network', caseLabel: 'CR-2024-04471' },
   { key: 'timeline', navLabel: 'Timeline', shell: true, title: 'Timeline', breadcrumb: ['Cases', 'CR-2024-04471', 'Timeline'], activeNav: 'cases', caseLabel: 'CR-2024-04471', subtitle: 'Reached contextually from a case — not a top-level nav destination.' },
   { key: 'map', navLabel: 'Crime Map', shell: true, title: 'Crime Map', breadcrumb: ['Crime Map'], activeNav: 'map', caseLabel: null },
-  { key: 'reports', navLabel: 'Reports', shell: true, title: 'Reports', breadcrumb: ['Reports'], activeNav: 'reports', caseLabel: null, actions: [{ text: 'New Report', kind: 'primary' }] },
+  { key: 'reports', navLabel: 'Reports', shell: true, title: 'Reports', breadcrumb: ['Reports'], activeNav: 'reports', caseLabel: null },
   { key: 'alerts', navLabel: 'Alerts', shell: true, title: 'Alerts', breadcrumb: ['Alerts'], activeNav: 'alerts', caseLabel: null },
   { key: 'admin', navLabel: 'Administration', shell: true, title: 'Administration', breadcrumb: ['Administration'], activeNav: 'admin', caseLabel: null },
   { key: 'settings', navLabel: 'Settings', shell: true, title: 'Settings', breadcrumb: ['Settings'], activeNav: 'settings', caseLabel: null }
 ];
 
+const FALLBACK_CASES: CaseItem[] = [
+  {
+    id: 'CR-2024-04471',
+    case_number: 'CR-2024-04471',
+    case_type: 'Robbery',
+    status: 'ACTIVE',
+    station_id: 'Koramangala P.S.',
+    assigned_officer_id: 'SI Ravi Kumar',
+    incident_date: '2024-09-15',
+    incident_address: 'Koramangala',
+    narrative: 'Incident reported near Koramangala with linked MO markers.',
+  },
+  {
+    id: 'CR-2023-11201',
+    case_number: 'CR-2023-11201',
+    case_type: 'Robbery',
+    status: 'CLOSED',
+    station_id: 'Tumkur P.S.',
+    assigned_officer_id: 'SI Ravi Kumar',
+    incident_date: '2023-11-18',
+    incident_address: 'Tumkur',
+  },
+  {
+    id: 'CR-2024-00892',
+    case_number: 'CR-2024-00892',
+    case_type: 'Robbery',
+    status: 'ACTIVE',
+    station_id: 'Mysuru P.S.',
+    assigned_officer_id: 'SI Ravi Kumar',
+    incident_date: '2024-02-04',
+    incident_address: 'Mysuru',
+  },
+];
+
+const FALLBACK_GRAPH: NetworkGraph = {
+  nodes: [
+    { data: { id: 'CR-2024-04471', label: 'Case:4471', type: 'CASE' } },
+    { data: { id: 'raju-kumar', label: 'Raju Kumar', type: 'PERSON' } },
+    { data: { id: 'suresh-m', label: 'Suresh M.', type: 'PERSON' } },
+    { data: { id: 'phone-9945', label: 'Phone:9945', type: 'PHONE' } },
+  ],
+  edges: [
+    { data: { id: 'e1', source: 'raju-kumar', target: 'CR-2024-04471', label: 'ACCUSED_IN' } },
+    { data: { id: 'e2', source: 'raju-kumar', target: 'suresh-m', label: 'ASSOCIATE' } },
+    { data: { id: 'e3', source: 'suresh-m', target: 'phone-9945', label: 'SHARES_PHONE' } },
+  ],
+};
+
+const FALLBACK_TIMELINE: TimelineEvent[] = [
+  { id: 'evt-1', case_id: 'CR-2024-04471', event_type: 'INCIDENT_REPORTED', description: 'Incident reported, Koramangala', event_date: '2024-09-15T00:00:00Z' },
+  { id: 'evt-2', case_id: 'CR-2024-04471', event_type: 'SUSPECT_IDENTIFIED', description: 'Suspect Raju K. identified', event_date: '2024-09-18T00:00:00Z' },
+  { id: 'evt-3', case_id: 'CR-2024-04471', event_type: 'CONFLICT', description: 'Conflicting location evidence', event_date: '2024-09-22T00:00:00Z', has_conflict: true },
+  { id: 'evt-4', case_id: 'CR-2024-04471', event_type: 'ARREST', description: 'Arrest made', event_date: '2024-09-30T00:00:00Z' },
+];
+
+function statusKind(status?: string) {
+  const value = (status || '').toUpperCase();
+  if (value.includes('ACTIVE') || value.includes('GENERATED')) return 'success';
+  if (value.includes('PENDING') || value.includes('MEDIUM') || value.includes('DRAFT')) return 'warning';
+  if (value.includes('HIGH') || value.includes('CRITICAL')) return 'critical';
+  return 'neutral';
+}
+
+function confidenceDots(value?: number | string | null) {
+  if (typeof value === 'number') return Math.max(1, Math.min(5, Math.round(value * 5)));
+  const normalized = String(value || '').toLowerCase();
+  if (normalized.includes('high')) return 4;
+  if (normalized.includes('low')) return 2;
+  if (normalized.includes('critical')) return 5;
+  return 3;
+}
+
+function shortDate(date?: string | null) {
+  if (!date) return '—';
+  const parsed = new Date(date);
+  if (Number.isNaN(parsed.getTime())) return date;
+  return parsed.toLocaleDateString('en-IN', { day: '2-digit', month: 'short', year: 'numeric' });
+}
+
 export function App() {
-  const [currentScreen, setCurrentScreen] = useState<string>('legend');
-  const [showAnnotations, setShowAnnotations] = useState<boolean>(false);
+  const [currentScreen, setCurrentScreen] = useState<string>(() => getStoredToken() ? 'workspace' : 'login');
+  const [apiStatus, setApiStatus] = useState<ApiStatus>('idle');
+  const [apiError, setApiError] = useState<string | null>(null);
+  const [toast, setToast] = useState<string | null>(null);
+  const [currentUser, setCurrentUser] = useState<ApiUser | null>(null);
+  const [loginForm, setLoginForm] = useState({ badge: '', password: '' });
+  const [loginError, setLoginError] = useState<string | null>(null);
+  const [cases, setCases] = useState<CaseItem[]>(FALLBACK_CASES);
+  const [selectedCaseId, setSelectedCaseId] = useState<string>(FALLBACK_CASES[0].id);
+  const [caseDetail, setCaseDetail] = useState<CaseItem | null>(null);
+  const [timeline, setTimeline] = useState<TimelineEvent[]>(FALLBACK_TIMELINE);
+  const [networkGraph, setNetworkGraph] = useState<NetworkGraph>(FALLBACK_GRAPH);
+  const [mapIncidents, setMapIncidents] = useState<MapIncident[]>([]);
+  const [hotspots, setHotspots] = useState<Hotspot[]>([]);
+  const [reports, setReports] = useState<ReportItem[]>([]);
+  const [alerts, setAlerts] = useState<AlertItem[]>([]);
+  const [adminUsers, setAdminUsers] = useState<ApiUser[]>([]);
+  const [auditEvents, setAuditEvents] = useState<AuditEvent[]>([]);
+  const [entityDetail, setEntityDetail] = useState<EntityDetail | null>(null);
+  const [entityCases, setEntityCases] = useState<CaseItem[]>([]);
+  const [searchQuery, setSearchQuery] = useState<string>('robbery');
+  const [searchResults, setSearchResults] = useState<SearchResultItem[]>([]);
+  const [conversationId, setConversationId] = useState<string | null>(null);
+  const [chatMessages, setChatMessages] = useState<ChatMessage[]>([]);
+  const [queryText, setQueryText] = useState<string>('');
+  const [reasoningSteps, setReasoningSteps] = useState<string[]>([]);
+  const [isSendingMessage, setIsSendingMessage] = useState<boolean>(false);
+  const [searchType, setSearchType] = useState<string>('');
+  const [mapTypeFilter, setMapTypeFilter] = useState<string>('');
+  const [mapStatusFilter, setMapStatusFilter] = useState<string>('');
+  const [alertSeverityFilter, setAlertSeverityFilter] = useState<string>('');
+  const [networkQuery, setNetworkQuery] = useState<string>('');
+  const [selectedNodeId, setSelectedNodeId] = useState<string>('');
+  const [graphZoom, setGraphZoom] = useState<number>(100);
+  const [timelineZoom, setTimelineZoom] = useState<number>(100);
+  const [entityQuestion, setEntityQuestion] = useState<string>('');
+  const [mapLayers, setMapLayers] = useState({ incidents: true, hotspots: true, boundaries: false });
+  const [settings, setSettings] = useState(() => ({
+    language: localStorage.getItem('ksp_language') || 'English',
+    density: localStorage.getItem('ksp_density') || 'Comfortable',
+    hotspotAlerts: localStorage.getItem('ksp_hotspot_alerts') !== 'off',
+    matchAlerts: localStorage.getItem('ksp_match_alerts') !== 'off',
+  }));
   
   // Scrim and Collapsible Overlays
   const [navOpen, setNavOpen] = useState<boolean>(false);
@@ -258,14 +675,109 @@ export function App() {
   // Selected row state for details drawer
   const [selectedCaseRow, setSelectedCaseRow] = useState<string | null>(null);
 
-  // Sync annotations class to body for the CSS selector
-  useEffect(() => {
-    if (showAnnotations) {
-      document.body.classList.add('show-annotations');
-    } else {
-      document.body.classList.remove('show-annotations');
+  const selectedCase = caseDetail || cases.find((item) => item.id === selectedCaseId || item.case_number === selectedCaseId) || FALLBACK_CASES[0];
+  const selectedCaseNumber = selectedCase.case_number || selectedCase.id;
+  const selectedEntityId = entityDetail?.id || selectedCase.entities?.[0]?.id || 'raju-kumar';
+
+  const loadCoreData = useCallback(async () => {
+    if (!getStoredToken()) return;
+    setApiStatus('loading');
+    setApiError(null);
+    try {
+      const [user, caseList, reportList, alertList, incidentList, hotspotList, userList, auditList] = await Promise.all([
+        api.me(),
+        api.listCases(),
+        api.reports().catch(() => []),
+        api.alerts().catch(() => []),
+        api.mapIncidents().catch(() => []),
+        api.hotspots().catch(() => []),
+        api.adminUsers().catch(() => []),
+        api.adminAudit().catch(() => []),
+      ]);
+
+      const liveCases = caseList.length ? caseList : FALLBACK_CASES;
+      setCurrentUser(user);
+      setCases(liveCases);
+      setReports(reportList);
+      setAlerts(alertList);
+      setMapIncidents(incidentList);
+      setHotspots(hotspotList);
+      setAdminUsers(userList);
+      setAuditEvents(auditList);
+      setSelectedCaseId((existing) => {
+        const hasExisting = liveCases.some((item) => item.id === existing || item.case_number === existing);
+        return hasExisting ? existing : liveCases[0].id;
+      });
+      setApiStatus('ready');
+    } catch (error) {
+      setApiError(error instanceof Error ? error.message : 'Unable to connect to backend');
+      setApiStatus('error');
     }
-  }, [showAnnotations]);
+  }, []);
+
+  useEffect(() => {
+    void loadCoreData();
+  }, [loadCoreData]);
+
+  useEffect(() => {
+    if (!getStoredToken() || !selectedCaseId) return;
+    let cancelled = false;
+    async function loadCaseContext() {
+      try {
+        const [detail, events, graph] = await Promise.all([
+          api.getCase(selectedCaseId).catch(() => null),
+          api.getCaseTimeline(selectedCaseId).catch(() => FALLBACK_TIMELINE),
+          api.getCaseNetwork(selectedCaseId).catch(() => FALLBACK_GRAPH),
+        ]);
+        if (cancelled) return;
+        setCaseDetail(detail);
+        setTimeline(events.length ? events : FALLBACK_TIMELINE);
+        setNetworkGraph(graph.nodes.length ? graph : FALLBACK_GRAPH);
+        const entityId = detail?.entities?.[0]?.id;
+        if (entityId) {
+          const [entity, relatedCases] = await Promise.all([
+            api.getEntity(entityId).catch(() => null),
+            api.getEntityCases(entityId).catch(() => []),
+          ]);
+          if (!cancelled) {
+            setEntityDetail(entity);
+            setEntityCases(relatedCases);
+          }
+        }
+      } catch {
+        if (!cancelled) {
+          setTimeline(FALLBACK_TIMELINE);
+          setNetworkGraph(FALLBACK_GRAPH);
+        }
+      }
+    }
+    void loadCaseContext();
+    return () => {
+      cancelled = true;
+    };
+  }, [selectedCaseId]);
+
+  useEffect(() => {
+    if (!getStoredToken() || !searchQuery.trim()) {
+      setSearchResults([]);
+      return;
+    }
+    const timeout = window.setTimeout(async () => {
+      try {
+        const response = await api.search(searchQuery.trim(), searchType || undefined);
+        setSearchResults(response.results);
+      } catch {
+        setSearchResults([]);
+      }
+    }, 300);
+    return () => window.clearTimeout(timeout);
+  }, [searchQuery, searchType]);
+
+  useEffect(() => {
+    if (!toast) return;
+    const timer = window.setTimeout(() => setToast(null), 2600);
+    return () => window.clearTimeout(timer);
+  }, [toast]);
 
   // Scrim Overlay Controllers
   const closeOverlays = () => {
@@ -274,9 +786,193 @@ export function App() {
   };
 
   const handleScreenChange = (key: string) => {
-    setCurrentScreen(key);
+    const aliases: Record<string, string> = {
+      cases: 'case',
+      profiles: 'entity',
+    };
+    setCurrentScreen(aliases[key] || key);
     closeOverlays();
     window.scrollTo(0, 0);
+  };
+
+  const handleLogin = async () => {
+    setLoginError(null);
+    setApiStatus('loading');
+    try {
+      const response = await api.login(loginForm.badge.trim(), loginForm.password);
+      storeAuthTokens(response);
+      setCurrentUser(response.user);
+      await loadCoreData();
+      handleScreenChange('workspace');
+    } catch (error) {
+      setLoginError(error instanceof Error ? error.message : 'Sign in failed');
+      setApiStatus('error');
+    }
+  };
+
+  const handleLogout = () => {
+    clearAuthTokens();
+    setCurrentUser(null);
+    setConversationId(null);
+    setChatMessages([]);
+    setApiStatus('idle');
+    setToast('Signed out');
+    handleScreenChange('login');
+  };
+
+  const refreshAll = async () => {
+    await loadCoreData();
+    setToast('Live data refreshed');
+  };
+
+  const downloadBlob = (filename: string, body: string, type = 'application/json') => {
+    const blob = new Blob([body], { type });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement('a');
+    link.href = url;
+    link.download = filename;
+    document.body.appendChild(link);
+    link.click();
+    link.remove();
+    URL.revokeObjectURL(url);
+  };
+
+  const exportJson = (filename: string, payload: unknown) => {
+    downloadBlob(filename, JSON.stringify(payload, null, 2));
+    setToast(`${filename} exported`);
+  };
+
+  const handleCreateReport = async () => {
+    const title = window.prompt('Report title', `${selectedCaseNumber} investigation brief`);
+    if (!title) return;
+    try {
+      const report = await api.createReport(selectedCase.id, title, conversationId);
+      setReports((prev) => [report, ...prev.filter((item) => item.id !== report.id)]);
+      setToast('Report draft created');
+    } catch (error) {
+      setToast(error instanceof Error ? error.message : 'Unable to create report');
+    }
+  };
+
+  const handleReportDownload = async (report: ReportItem) => {
+    if (report.id.startsWith('fallback')) {
+      exportJson(`${report.title.replace(/\s+/g, '-').toLowerCase()}.json`, report);
+      return;
+    }
+    try {
+      const response = await api.downloadReport(report.id);
+      if (response.download_url) {
+        window.open(response.download_url, '_blank', 'noopener,noreferrer');
+      } else {
+        exportJson(`${report.title}.json`, report);
+      }
+    } catch (error) {
+      setToast(error instanceof Error ? error.message : 'Unable to download report');
+    }
+  };
+
+  const handleAddNote = () => {
+    const note = window.prompt('Add investigation note');
+    if (!note) return;
+    setReasoningSteps((prev) => [...prev, `Investigator note: ${note}`]);
+    setToast('Note added to reasoning trace');
+  };
+
+  const handleEntityQuestion = async (text: string) => {
+    handleScreenChange('workspace');
+    window.setTimeout(() => void handleSendQuery(text), 0);
+  };
+
+  const handleSaveSettings = () => {
+    localStorage.setItem('ksp_language', settings.language);
+    localStorage.setItem('ksp_density', settings.density);
+    localStorage.setItem('ksp_hotspot_alerts', settings.hotspotAlerts ? 'on' : 'off');
+    localStorage.setItem('ksp_match_alerts', settings.matchAlerts ? 'on' : 'off');
+    setToast('Settings saved');
+  };
+
+  const handleAddUser = async () => {
+    const badge = window.prompt('Badge number');
+    const fullName = badge ? window.prompt('Full name') : null;
+    const role = fullName ? window.prompt('Role', 'SI') : null;
+    const password = role ? window.prompt('Temporary password (12+ characters)') : null;
+    if (!badge || !fullName || !role || !password) return;
+    try {
+      const user = await api.createAdminUser({
+        badge_number: badge,
+        full_name: fullName,
+        role,
+        rank: role,
+        password,
+      });
+      setAdminUsers((prev) => [user, ...prev]);
+      setToast('User created');
+    } catch (error) {
+      setToast(error instanceof Error ? error.message : 'Unable to create user');
+    }
+  };
+
+  const handleEditUser = async (user: ApiUser) => {
+    const role = window.prompt('Update role', user.role);
+    if (!role || role === user.role) return;
+    try {
+      const updated = await api.updateAdminUser(user.id, { role, rank: role });
+      setAdminUsers((prev) => prev.map((item) => item.id === user.id ? updated : item));
+      setToast('User updated');
+    } catch (error) {
+      setToast(error instanceof Error ? error.message : 'Unable to update user');
+    }
+  };
+
+  const ensureConversation = async () => {
+    if (conversationId) return conversationId;
+    const conversation = await api.createConversation(selectedCase.id);
+    setConversationId(conversation.id);
+    return conversation.id;
+  };
+
+  const handleSendQuery = async (directQuery?: string) => {
+    const text = (directQuery ?? queryText).trim();
+    if (!text || isSendingMessage) return;
+    setIsSendingMessage(true);
+    setReasoningSteps([]);
+    setChatMessages((prev) => [...prev, { id: `local-${Date.now()}`, role: 'USER', content: text }]);
+    setQueryText('');
+
+    try {
+      const activeConversationId = await ensureConversation();
+      await streamConversationMessage(activeConversationId, text, 'en', (event) => {
+        const stage = String(event.stage || '');
+        if (stage && stage !== 'COMPOSITION') {
+          setReasoningSteps((prev) => [...prev, String(event.content || stage)]);
+        }
+        if (stage === 'COMPOSITION' || event.response) {
+          setChatMessages((prev) => [
+            ...prev,
+            {
+              id: `assistant-${Date.now()}`,
+              role: 'ASSISTANT',
+              content: String(event.response || ''),
+              confidence_tier: String(event.confidence || 'Moderate'),
+              sources: Array.isArray(event.sources) ? event.sources as Record<string, unknown>[] : [],
+            },
+          ]);
+        }
+      });
+    } catch (error) {
+      setChatMessages((prev) => [
+        ...prev,
+        {
+          id: `assistant-error-${Date.now()}`,
+          role: 'ASSISTANT',
+          content: error instanceof Error ? error.message : 'Unable to reach reasoning engine.',
+          confidence_tier: 'Low',
+          has_conflict: true,
+        },
+      ]);
+    } finally {
+      setIsSendingMessage(false);
+    }
   };
 
   const toggleReasoning = (id: string) => {
@@ -339,175 +1035,122 @@ export function App() {
      SCREEN VIEW RENDERERS
      ============================================================ */
 
-  const renderLegendView = () => (
-    <div className="legend-wrap">
-      <h1 style={{ fontSize: '23px', marginBottom: '4px', fontWeight: 700 }}>Design System Reference</h1>
-      <p style={{ color: 'var(--n-500)', fontSize: '13px', marginBottom: '30px' }}>
-        High-fidelity visual system derived from the official Karnataka State Police crest. This page documents the tokens — it is not a product screen.
-      </p>
-
-      <h2 className="section-h">Color — Primary (from the crest shield)</h2>
-      <div className="legend-swatch">
-        <div className="color-chip"><div className="sw" style={{ background: 'var(--navy-900)' }}></div><div className="cn">navy-900</div><div className="cv">#101A33</div></div>
-        <div className="color-chip"><div className="sw" style={{ background: 'var(--navy-700)' }}></div><div className="cn">navy-700</div><div className="cv">#1D2F5E</div></div>
-        <div className="color-chip"><div className="sw" style={{ background: 'var(--navy-600)' }}></div><div className="cn">navy-600</div><div className="cv">#26397A</div></div>
-        <div className="color-chip"><div className="sw" style={{ background: 'var(--navy-500)' }}></div><div className="cn">navy-500</div><div className="cv">#2F4A94</div></div>
-        <div className="color-chip"><div className="sw" style={{ background: 'var(--navy-100)' }}></div><div className="cn">navy-100</div><div className="cv">#E7EBF6</div></div>
-      </div>
-      <p style={{ fontSize: '12px', color: 'var(--n-500)', marginTop: '10px' }}>
-        Used for: primary actions, active navigation, links, focus rings, selected rows. This is the only color used for interactive/functional state.
-      </p>
-
-      <h2 className="section-h" style={{ marginTop: '26px' }}>Signature accent (from the crest's gold ribbon)</h2>
-      <div className="legend-swatch">
-        <div className="color-chip"><div className="sw" style={{ background: 'var(--gold-500)' }}></div><div className="cn">gold-500</div><div className="cv">#B8862E</div></div>
-      </div>
-      <p style={{ fontSize: '12px', color: 'var(--n-500)', marginTop: '10px' }}>
-        Used in exactly two places platform-wide: the 3px header hairline and the login card's top edge. Reserved as a signature touch — never used for interactive elements, to keep daily-use surfaces calm.
-      </p>
-
-      <h2 className="section-h" style={{ marginTop: '26px' }}>Semantic colors (status only — never decorative)</h2>
-      <div className="legend-swatch">
-        <div className="color-chip"><div className="sw" style={{ background: 'var(--success-600)' }}></div><div className="cn">success</div><div className="cv">from crest green</div></div>
-        <div className="color-chip"><div className="sw" style={{ background: 'var(--warning-600)' }}></div><div className="cn">warning</div><div className="cv">from crest gold</div></div>
-        <div className="color-chip"><div className="sw" style={{ background: 'var(--critical-600)' }}></div><div className="cn">critical</div><div className="cv">from crest maroon</div></div>
-        <div className="color-chip"><div className="sw" style={{ background: 'var(--n-600)' }}></div><div className="cn">neutral</div><div className="cv">#565C66</div></div>
-      </div>
-      <p style={{ fontSize: '12px', color: 'var(--n-500)', marginTop: '10px' }}>
-        Confidence indicators are deliberately <b>not</b> mapped to this scale — certainty is a neutral navy measure, not a status judgement (low confidence isn't an "error").
-      </p>
-
-      <h2 className="section-h" style={{ marginTop: '26px' }}>Typography</h2>
-      <div style={{ font: '700 22px var(--font-ui)' }}>Aa — IBM Plex Sans (UI & headings)</div>
-      <div className="kn" style={{ font: '600 20px "Noto Sans Kannada"', marginTop: '8px' }}>ಕರ್ನಾಟಕ ರಾಜ್ಯ ಪೊಲೀಸ್ — Noto Sans Kannada (paired for parity)</div>
-      <div style={{ font: '600 15px var(--font-mono)', marginTop: '8px', color: 'var(--n-700)' }}>CR-2024-04471 — IBM Plex Mono (case numbers, codes, confidence)</div>
-      <p style={{ fontSize: '12px', color: 'var(--n-500)', marginTop: '12px' }}>
-        For production deployment on Karnataka SDC infrastructure, self-host these three font families rather than depending on an external CDN at runtime, consistent with the sovereign-infrastructure requirements established in the platform's architecture blueprint.
-      </p>
-
-      <h2 className="section-h" style={{ marginTop: '26px' }}>Component samples</h2>
-      <div className="legend-swatch" style={{ marginBottom: '14px' }}>
-        <Btn text="Primary Action" kind="primary" />{' '}
-        <Btn text="Secondary Action" />{' '}
-        <Btn text="Ghost" kind="ghost" />{' '}
-        <Btn text="Disabled" disabled />
-      </div>
-      <div className="legend-swatch" style={{ marginBottom: '14px' }}>
-        <Badge text="ACTIVE" kind="success" />{' '}
-        <Badge text="PENDING FSL" kind="warning" />{' '}
-        <Badge text="HIGH" kind="critical" />{' '}
-        <Badge text="CLOSED" kind="neutral" />{' '}
-        <Badge text="CASE MATCH" kind="info" />
-      </div>
-      <div style={{ marginBottom: '14px' }}>
-        <Confidence n={4} labelText="High confidence" />
-      </div>
-      <div style={{ maxWidth: '340px' }}>
-        <Field label="Input — default" placeholder="Placeholder text" />
-      </div>
-      <div style={{ maxWidth: '340px' }}>
-        <div className="field">
-          <label>Input — error state</label>
-          <input className="input error" type="text" placeholder="Required field" />
-          <div className="field-error"><span className="conflict-flag" style={{ width: '14px', height: '14px', fontSize: '9px' }}>!</span> This field has errors.</div>
-        </div>
-      </div>
-
-      <h2 className="section-h" style={{ marginTop: '26px' }}>Shell invariants (unchanged from approved wireframe)</h2>
-      <ul style={{ fontSize: '12.5px', color: 'var(--n-600)', lineHeight: 1.9 }}>
-        <li>Header: 60px, crest + product name, case selector, spacer, language, notifications, profile — always in that order.</li>
-        <li>Left navigation: fixed 10-item order, never added to or reordered. Collapses to an icon rail below 1200px, an off-canvas drawer below 768px.</li>
-        <li>Right context panel: 328px, becomes an off-canvas overlay below 1024px.</li>
-        <li>Only the visual system changed in this pass — information architecture, navigation order, and component placement are exactly as approved.</li>
-      </ul>
-
-      <h2 className="section-h" style={{ marginTop: '26px' }}>Reviewing structure labels</h2>
-      <p style={{ fontSize: '12.5px', color: 'var(--n-500)' }}>
-        Use the "Annotations" toggle in the reference bar above to overlay the component-boundary labels from the approved wireframe phase, for cross-reference during handoff.
-      </p>
-    </div>
-  );
-
   const renderLoginView = () => (
     <div className="login-wrap">
       <div className="login-card">
         <img className="crest" src={CREST_SRC} alt="Karnataka State Police crest" />
         <h1>KSP Crime Intelligence Platform</h1>
         <div className="sub">Karnataka State Police &middot; SCRB</div>
-        <Field label="Badge / Employee ID" placeholder="e.g. KSP-44210" />
-        <Field label="Password" placeholder="••••••••" type="password" />
-        <Btn text="Sign In" kind="primary" onClick={() => handleScreenChange('workspace')} />
+        <Field
+          label="Badge / Employee ID"
+          placeholder="e.g. KSP-44210"
+          value={loginForm.badge}
+          onChange={(event) => setLoginForm((prev) => ({ ...prev, badge: event.target.value }))}
+        />
+        <Field
+          label="Password"
+          placeholder="••••••••"
+          type="password"
+          value={loginForm.password}
+          onChange={(event) => setLoginForm((prev) => ({ ...prev, password: event.target.value }))}
+          onKeyDown={(event) => {
+            if (event.key === 'Enter') void handleLogin();
+          }}
+        />
+        {loginError && <div className="field-error"><span className="conflict-flag" style={{ width: '14px', height: '14px', fontSize: '9px' }}>!</span> {loginError}</div>}
+        <Btn text={apiStatus === 'loading' ? 'Signing In...' : 'Sign In'} kind="primary" onClick={() => void handleLogin()} disabled={apiStatus === 'loading'} />
         <div className="login-foot">Authorized personnel only<span className="sep">&middot;</span>All access is logged and audited</div>
       </div>
     </div>
   );
 
-  const renderWorkspaceView = () => (
-    <>
-      <PanelBlock label="CONVERSATION PANEL">
-        <div className="msg">
-          <span className="avatar">SR</span>
-          <div className="msg-bubble" style={{ maxWidth: '520px' }}>
-            <div className="msg-meta">User</div>
-            <div className="msg-body">Has this MO appeared elsewhere in Karnataka in 2024?</div>
-          </div>
-        </div>
-        <div className="msg" style={{ maxWidth: '640px' }}>
-          <span className="avatar ai">AI</span>
-          <div className="msg-bubble">
-            <div className="msg-meta">AI Response &nbsp;<Confidence n={3} labelText="Moderate" /></div>
-            <div className="msg-body">3 similar cases found based on modus-operandi similarity: CR-2023-11201 (Tumkur), CR-2024-00892 (Mysuru), CR-2024-03107 (Bengaluru).</div>
-            <div className="source-row">
-              <span className="source-chip">IIF-1 &middot; CR-2023-11201</span>
-              <span className="source-chip">IIF-1 &middot; CR-2024-00892</span>
-              <span className="source-chip">IIF-1 &middot; CR-2024-03107</span>
-            </div>
-            {renderReasoningToggle(
-              'rz_mo_similarity',
-              'Matched on: weapon type (2/3), entry method (3/3), time-of-day window (2/3). Diagnosticity favors CR-2023-11201 most strongly — all three attributes align.'
-            )}
-          </div>
-        </div>
-        <div className="msg" style={{ maxWidth: '640px' }}>
-          <span className="avatar ai">AI</span>
-          <div className="msg-bubble">
-            <div className="msg-meta">AI Response &nbsp;<Confidence n={4} labelText="High" /></div>
-            <div className="msg-body">Phone CDR places the suspect in Whitefield at 21:40. This conflicts with a witness statement placing them at the scene at the same time.</div>
-            <div className="conflict-box">
-              <div className="conflict-head"><span className="conflict-flag">!</span> Conflicting evidence</div>
-              <p>Source A (CDR) and Source B (Witness) cannot both be correct. Neither has been discounted.</p>
-              <Btn text="Investigate conflict" kind="secondary" onClick={() => handleScreenChange('timeline')} />
-            </div>
-          </div>
-        </div>
-      </PanelBlock>
+  const renderWorkspaceView = () => {
+    const visibleMessages = chatMessages.length
+      ? chatMessages
+      : [
+          { role: 'USER', content: 'Has this MO appeared elsewhere in Karnataka in 2024?' },
+          {
+            role: 'ASSISTANT',
+            content: '3 similar cases found based on modus-operandi similarity: CR-2023-11201 (Tumkur), CR-2024-00892 (Mysuru), CR-2024-03107 (Bengaluru).',
+            confidence_tier: 'Moderate',
+            sources: [{ label: 'IIF-1 · CR-2023-11201' }, { label: 'IIF-1 · CR-2024-00892' }, { label: 'IIF-1 · CR-2024-03107' }],
+          },
+        ];
 
-      <PanelBlock label="QUERY INPUT">
-        <div className="query-bar">
-          <div className="icon-btn-inline"><Ic name="mic" /></div>
-          <input placeholder="Ask anything about this case — English or ಕನ್ನಡ" />
-          <div className="icon-btn-inline primary"><Ic name="send" /></div>
-        </div>
-      </PanelBlock>
+    return (
+      <>
+        <PanelBlock label="CONVERSATION PANEL">
+          {apiError && <div className="conflict-box"><div className="conflict-head"><span className="conflict-flag">!</span> Backend connection</div><p>{apiError}</p></div>}
+          {visibleMessages.map((message, index) => {
+            const isAi = message.role === 'ASSISTANT';
+            const sources = message.sources || [];
+            return (
+              <div className="msg" style={{ maxWidth: isAi ? '640px' : '520px' }} key={`${message.role}-${index}`}>
+                <span className={`avatar ${isAi ? 'ai' : ''}`}>{isAi ? 'AI' : (currentUser?.full_name || 'User').split(' ').map((part) => part[0]).slice(0, 2).join('')}</span>
+                <div className="msg-bubble">
+                  <div className="msg-meta">
+                    {isAi ? 'AI Response' : 'User'} {isAi && <>&nbsp;<Confidence n={confidenceDots(message.confidence_tier)} labelText={message.confidence_tier || 'Moderate'} /></>}
+                  </div>
+                  <div className="msg-body">{message.content}</div>
+                  {sources.length > 0 && (
+                    <div className="source-row">
+                      {sources.slice(0, 4).map((source, sourceIndex) => (
+                        <span className="source-chip" key={sourceIndex}>{String(source.label || source.case_number || source.title || `Source ${sourceIndex + 1}`)}</span>
+                      ))}
+                    </div>
+                  )}
+                  {isAi && renderReasoningToggle(
+                    `rz_msg_${index}`,
+                    reasoningSteps.length ? reasoningSteps.join(' · ') : 'Matched through the backend reasoning pipeline and persisted to the conversation record.'
+                  )}
+                  {message.has_conflict && (
+                    <div className="conflict-box">
+                      <div className="conflict-head"><span className="conflict-flag">!</span> Conflicting evidence</div>
+                      <p>Review the linked timeline and source records before using this answer operationally.</p>
+                      <Btn text="Investigate conflict" kind="secondary" onClick={() => handleScreenChange('timeline')} />
+                    </div>
+                  )}
+                </div>
+              </div>
+            );
+          })}
+          {isSendingMessage && <div className="source-chip">Reasoning engine is working...</div>}
+        </PanelBlock>
+
+        <PanelBlock label="QUERY INPUT">
+          <div className="query-bar">
+            <div className="icon-btn-inline"><Ic name="mic" /></div>
+            <input
+              placeholder="Ask anything about this case — English or ಕನ್ನಡ"
+              value={queryText}
+              onChange={(event) => setQueryText(event.target.value)}
+              onKeyDown={(event) => {
+                if (event.key === 'Enter') void handleSendQuery();
+              }}
+            />
+            <div className="icon-btn-inline primary" onClick={() => void handleSendQuery()}><Ic name="send" /></div>
+          </div>
+        </PanelBlock>
 
       <PanelBlock label="VISUALIZATION LAUNCHERS">
         <div className="filter-bar">
           <Btn text="← Timeline" onClick={() => handleScreenChange('timeline')} />
-          <Btn text="Network &nearr;" onClick={() => handleScreenChange('network')} />
-          <Btn text="Map &nearr;" onClick={() => handleScreenChange('map')} />
+          <Btn text="Network ↗" onClick={() => handleScreenChange('network')} />
+          <Btn text="Map ↗" onClick={() => handleScreenChange('map')} />
         </div>
       </PanelBlock>
     </>
-  );
+    );
+  };
 
   const renderWorkspaceRight = () => (
     <>
       <PanelBlock label="CASE CONTEXT CARD" head="Overview">
         <Kv rows={[
-          ['Case No.', 'CR-2024-04471'],
-          ['Type', 'Robbery'],
-          ['Status', <Badge text="ACTIVE" kind="success" />],
-          ['IO', 'SI Ravi Kumar']
+          ['Case No.', selectedCaseNumber],
+          ['Type', selectedCase.case_type],
+          ['Status', <Badge key="case-status" text={selectedCase.status} kind={statusKind(selectedCase.status)} />],
+          ['IO', selectedCase.assigned_officer_id || 'Unassigned']
         ]} />
       </PanelBlock>
 
@@ -521,14 +1164,14 @@ export function App() {
           <Confidence n={2} />
         </div>
         <div style={{ marginTop: '10px' }}>
-          <Btn text="+ Add note" kind="ghost" />
+          <Btn text="+ Add note" kind="ghost" onClick={handleAddNote} />
         </div>
       </PanelBlock>
 
       <PanelBlock label="OPEN QUESTIONS" head="Open Questions">
         <div className="list">
-          <div className="list-item">Weapon source unconfirmed</div>
-          <div className="list-item">Third associate unidentified</div>
+          <div className="list-item">{timeline.find((event) => event.has_conflict)?.description || 'Weapon source unconfirmed'}</div>
+          <div className="list-item">{selectedCase.entities?.length ? `${selectedCase.entities.length} linked entities need review` : 'Third associate unidentified'}</div>
         </div>
       </PanelBlock>
     </>
@@ -539,17 +1182,22 @@ export function App() {
       <PanelBlock label="GLOBAL SEARCH">
         <div className="search-bar">
           <Ic name="search" />
-          <input placeholder="Search cases, suspects, MO, locations — English or ಕನ್ನಡ" />
+          <input
+            placeholder="Search cases, suspects, MO, locations — English or ಕನ್ನಡ"
+            value={searchQuery}
+            onChange={(event) => setSearchQuery(event.target.value)}
+          />
           <Ic name="mic" />
         </div>
       </PanelBlock>
 
       <PanelBlock label="FILTERS">
         <div className="filter-bar">
-          <span className="filter-chip">Type <Ic name="chevronDown" cls="ic-sm" /></span>
-          <span className="filter-chip">Date Range <Ic name="chevronDown" cls="ic-sm" /></span>
-          <span className="filter-chip">District <Ic name="chevronDown" cls="ic-sm" /></span>
-          <span className="filter-chip">Status <Ic name="chevronDown" cls="ic-sm" /></span>
+          <button className={`filter-chip ${searchType === '' ? 'active' : ''}`} onClick={() => setSearchType('')}>All</button>
+          <button className={`filter-chip ${searchType === 'CASE' ? 'active' : ''}`} onClick={() => setSearchType('CASE')}>Cases</button>
+          <button className={`filter-chip ${searchType === 'PERSON' ? 'active' : ''}`} onClick={() => setSearchType('PERSON')}>Persons</button>
+          <button className={`filter-chip ${searchType === 'VEHICLE' ? 'active' : ''}`} onClick={() => setSearchType('VEHICLE')}>Vehicles</button>
+          <Btn text="Refresh" kind="ghost" onClick={() => void refreshAll()} />
         </div>
       </PanelBlock>
 
@@ -568,34 +1216,42 @@ export function App() {
                 </tr>
               </thead>
               <tbody>
-                <tr className={selectedCaseRow === 'CR-2024-04471' ? 'selected' : ''} onClick={() => setSelectedCaseRow('CR-2024-04471')}>
-                  <td>CR-2024-04471</td>
-                  <td>Robbery</td>
-                  <td>Koramangala</td>
-                  <td><Badge text="ACTIVE" kind="success" /></td>
-                  <td><Confidence n={3} /></td>
-                  <td><Btn text="Open" kind="ghost" onClick={() => handleScreenChange('case')} /></td>
-                </tr>
-                <tr className={selectedCaseRow === 'CR-2023-11201' ? 'selected' : ''} onClick={() => setSelectedCaseRow('CR-2023-11201')}>
-                  <td>CR-2023-11201</td>
-                  <td>Robbery</td>
-                  <td>Tumkur</td>
-                  <td><Badge text="CLOSED" kind="neutral" /></td>
-                  <td><Confidence n={4} /></td>
-                  <td><Btn text="Open" kind="ghost" onClick={() => handleScreenChange('case')} /></td>
-                </tr>
-                <tr className={selectedCaseRow === 'CR-2024-00892' ? 'selected' : ''} onClick={() => setSelectedCaseRow('CR-2024-00892')}>
-                  <td>CR-2024-00892</td>
-                  <td>Robbery</td>
-                  <td>Mysuru</td>
-                  <td><Badge text="ACTIVE" kind="success" /></td>
-                  <td><Confidence n={4} /></td>
-                  <td><Btn text="Open" kind="ghost" onClick={() => handleScreenChange('case')} /></td>
-                </tr>
+                {(searchResults.length ? searchResults : cases.map((item) => ({
+                  id: item.id,
+                  type: 'CASE',
+                  title: item.case_number,
+                  description: item.case_type,
+                  relevance_score: 0.75,
+                  metadata: { case_number: item.case_number, status: item.status, district: item.incident_address || item.station_id },
+                }))).slice(0, 10).map((result) => {
+                  const metadata = (result.metadata || {}) as Record<string, unknown>;
+                  const caseNumber = String(metadata.case_number || result.title.replace(/^Case\s+/i, ''));
+                  const status = String(metadata.status || 'ACTIVE');
+                  return (
+                    <tr className={selectedCaseRow === result.id ? 'selected' : ''} onClick={() => setSelectedCaseRow(result.id)} key={result.id}>
+                      <td>{caseNumber}</td>
+                      <td>{result.description || result.type}</td>
+                      <td>{String(metadata.district || metadata.station_id || '—')}</td>
+                      <td><Badge text={status} kind={statusKind(status)} /></td>
+                      <td><Confidence n={confidenceDots(result.relevance_score || 0.6)} /></td>
+                      <td><Btn text="Open" kind="ghost" onClick={async (event) => {
+                        event.stopPropagation();
+                        if (result.type === 'ENTITY') {
+                          const entity = await api.getEntity(result.id).catch(() => null);
+                          setEntityDetail(entity);
+                          handleScreenChange('entity');
+                          return;
+                        }
+                        setSelectedCaseId(result.id);
+                        handleScreenChange('case');
+                      }} /></td>
+                    </tr>
+                  );
+                })}
               </tbody>
             </table>
           </div>
-          <Pagination text="Showing 1–10 of 47 results" />
+          <Pagination text={`Showing 1–${Math.min(10, (searchResults.length || cases.length))} of ${searchResults.length || cases.length} results`} />
         </PanelBlock>
 
         {selectedCaseRow && (
@@ -608,13 +1264,16 @@ export function App() {
               </span>
             </div>
             <Kv rows={[
-              ['Type', 'Robbery'],
-              ['District', selectedCaseRow === 'CR-2023-11201' ? 'Tumkur' : selectedCaseRow === 'CR-2024-00892' ? 'Mysuru' : 'Koramangala'],
-              ['Status', <Badge text={selectedCaseRow === 'CR-2023-11201' ? 'CLOSED' : 'ACTIVE'} kind={selectedCaseRow === 'CR-2023-11201' ? 'neutral' : 'success'} />],
-              ['MO Match', 'High']
+              ['Type', searchResults.find((item) => item.id === selectedCaseRow)?.description || 'Case'],
+              ['District', String(searchResults.find((item) => item.id === selectedCaseRow)?.metadata?.district || '—')],
+              ['Status', <Badge key="drawer-status" text={String(searchResults.find((item) => item.id === selectedCaseRow)?.metadata?.status || 'ACTIVE')} kind={statusKind(String(searchResults.find((item) => item.id === selectedCaseRow)?.metadata?.status || 'ACTIVE'))} />],
+              ['MO Match', searchResults.length ? 'Backend ranked' : 'High']
             ]} />
             <div style={{ marginTop: '14px' }}>
-              <Btn text="Open Full Case &nearr;" kind="primary" onClick={() => handleScreenChange('case')} />
+              <Btn text="Open Full Case ↗" kind="primary" onClick={() => {
+                setSelectedCaseId(selectedCaseRow);
+                handleScreenChange('case');
+              }} />
             </div>
           </div>
         )}
@@ -627,17 +1286,17 @@ export function App() {
       <PanelBlock label="CASE HEADER">
         <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', flexWrap: 'wrap', gap: '12px' }}>
           <div>
-            <div style={{ fontSize: '16.5px', fontWeight: 700 }}>CR-2024-04471 — Robbery</div>
+            <div style={{ fontSize: '16.5px', fontWeight: 700 }}>{selectedCaseNumber} — {selectedCase.case_type}</div>
             <div style={{ color: 'var(--n-500)', marginTop: '3px', fontSize: '12.5px' }}>
-              Koramangala P.S. &middot; Assigned: SI Ravi Kumar
+              {selectedCase.station_id || selectedCase.incident_address || 'Station pending'} &middot; Assigned: {selectedCase.assigned_officer_id || 'Unassigned'}
             </div>
             <div style={{ marginTop: '9px' }}>
-              <Badge text="ACTIVE" kind="success" />
+              <Badge text={selectedCase.status} kind={statusKind(selectedCase.status)} />
             </div>
           </div>
           <div className="actions">
             <Btn text="Ask AI about this case" kind="secondary" onClick={() => handleScreenChange('workspace')} />
-            <Btn text="Export PDF" kind="primary" />
+            <Btn text="Generate Report" kind="primary" onClick={() => void handleCreateReport()} />
           </div>
         </div>
       </PanelBlock>
@@ -649,16 +1308,17 @@ export function App() {
           <div key="overview">
             <PanelBlock label="FACTS" head="Timeline Facts">
               <div className="list">
-                <div className="list-item"><span>Incident reported 15-Sep-2024, Koramangala</span><span className="source-chip">FIR</span></div>
-                <div className="list-item"><span>Suspect identified via witness statement</span><span className="source-chip">Case Diary</span></div>
-                <div className="list-item"><span>Arrest made 30-Sep-2024</span><span className="source-chip">Case Diary</span></div>
+                {timeline.slice(0, 3).map((event) => (
+                  <div className="list-item" key={event.id}><span>{shortDate(event.event_date)} — {event.description}</span><span className="source-chip">{event.event_type.replace(/_/g, ' ')}</span></div>
+                ))}
               </div>
             </PanelBlock>
             <PanelBlock label="LINKED ENTITIES" head="Relationships">
               <div className="filter-bar">
-                <Chip text="Raju Kumar — Accused" />
-                <Chip text="Suresh M. — Associate" />
-                <Chip text="9880-XXXX — Phone" />
+                {(selectedCase.entities?.length ? selectedCase.entities : [
+                  { canonical_name: 'Raju Kumar', role: 'Accused', id: 'raju-kumar', entity_type: 'PERSON' },
+                  { canonical_name: 'Suresh M.', role: 'Associate', id: 'suresh-m', entity_type: 'PERSON' },
+                ]).map((entity) => <Chip key={entity.id} text={`${entity.canonical_name} — ${entity.role || entity.entity_type}`} />)}
               </div>
             </PanelBlock>
           </div>,
@@ -666,25 +1326,26 @@ export function App() {
             <Table
               headers={['Exhibit ID', 'Type', 'Status', 'Chain of Custody']}
               rows={[
-                ['EX-001', 'Weapon', <Badge text="LOGGED" kind="success" />, 'Verified'],
-                ['EX-002', 'CCTV Footage', <Badge text="LOGGED" kind="success" />, 'Verified'],
-                ['EX-003', 'Phone CDR', <Badge text="PENDING FSL" kind="warning" />, '—']
+                ['EX-001', 'Weapon', <Badge key="ex1" text="LOGGED" kind="success" />, 'Verified'],
+                ['EX-002', 'CCTV Footage', <Badge key="ex2" text="LOGGED" kind="success" />, 'Verified'],
+                ['EX-003', 'Phone CDR', <Badge key="ex3" text="PENDING FSL" kind="warning" />, '—']
               ]}
             />
           </PanelBlock>,
           <PanelBlock label="ENTITIES" head="Associated Persons / Objects" key="entities">
             <div className="filter-bar">
-              <Chip text="Raju Kumar" />
-              <Chip text="Suresh M." />
-              <Chip text="9880-XXXX" />
+              {(selectedCase.entities?.length ? selectedCase.entities : [{ canonical_name: 'Raju Kumar', id: 'raju-kumar' }, { canonical_name: 'Suresh M.', id: 'suresh-m' }, { canonical_name: '9880-XXXX', id: 'phone' }]).map((entity) => <Chip key={entity.id} text={entity.canonical_name} />)}
             </div>
           </PanelBlock>,
           <PanelBlock label="TIMELINE" head="Chronological Chain" key="timeline">
-            <PlaceholderCanvas iconName="map" label="Timeline preview" note="Open the full Timeline view from Case Context for the interactive version." height="160px" />
+            <TimelineCanvas events={timeline} zoom={100} height="170px" compact />
+            <div style={{ marginTop: '12px' }}>
+              <Btn text="Open Timeline ↗" kind="ghost" onClick={() => handleScreenChange('timeline')} />
+            </div>
           </PanelBlock>,
           <PanelBlock label="NARRATIVE" head="Narrative Record" key="narrative">
             <div style={{ fontSize: '12.5px', color: 'var(--n-700)', lineHeight: '1.7' }}>
-              Full case narrative text renders here, sourced from the case diary and FIR, in the language it was originally recorded.
+              {selectedCase.narrative || 'Full case narrative text renders here, sourced from the case diary and FIR, in the language it was originally recorded.'}
             </div>
           </PanelBlock>
         ]
@@ -696,16 +1357,17 @@ export function App() {
     <>
       <PanelBlock label="QUICK STATS" head="Overview">
         <Kv rows={[
-          ['Opened', '15-Sep-2024'],
-          ['Days Open', '19'],
-          ['Linked Cases', '3'],
-          ['Exhibits', '3']
+          ['Opened', shortDate(selectedCase.created_at || selectedCase.incident_date)],
+          ['Days Open', selectedCase.status === 'ACTIVE' && selectedCase.created_at ? String(Math.max(1, Math.round((Date.now() - new Date(selectedCase.created_at).getTime()) / 86400000))) : '—'],
+          ['Linked Entities', String(selectedCase.entities?.length || networkGraph.nodes.length - 1 || 0)],
+          ['Exhibits', String(selectedCase.exhibits?.length || 0)]
         ]} />
       </PanelBlock>
       <PanelBlock label="RELATED CASES" head="Associations">
         <div className="list">
-          <div className="list-item">CR-2023-11201 <span style={{ color: 'var(--n-500)', fontSize: '11.5px' }}>MO match</span></div>
-          <div className="list-item">CR-2024-00892 <span style={{ color: 'var(--n-500)', fontSize: '11.5px' }}>MO match</span></div>
+          {cases.filter((item) => item.id !== selectedCase.id).slice(0, 2).map((item) => (
+            <div className="list-item" key={item.id}>{item.case_number} <span style={{ color: 'var(--n-500)', fontSize: '11.5px' }}>MO match</span></div>
+          ))}
         </div>
       </PanelBlock>
     </>
@@ -717,19 +1379,17 @@ export function App() {
         <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', flexWrap: 'wrap', gap: '12px' }}>
           <div>
             <div style={{ fontSize: '16.5px', fontWeight: 700 }}>
-              Raju Kumar <span style={{ fontWeight: 400, color: 'var(--n-500)', fontSize: '12.5px' }}>— Person</span>
+              {entityDetail?.canonical_name || selectedCase.entities?.[0]?.canonical_name || 'Raju Kumar'} <span style={{ fontWeight: 400, color: 'var(--n-500)', fontSize: '12.5px' }}>— {entityDetail?.entity_type || selectedCase.entities?.[0]?.entity_type || 'Person'}</span>
             </div>
             <div style={{ marginTop: '11px' }}>
-              <Chip text="Raja K" />
-              <Chip text="Raju Sh" />
-              <Chip text="ರಾಜು ಕುಮಾರ" />
+              {(entityDetail?.aliases?.length ? entityDetail.aliases.map((alias) => alias.alias_text) : ['Raja K', 'Raju Sh', 'ರಾಜು ಕುಮಾರ']).map((alias) => <Chip text={alias} key={alias} />)}
             </div>
             <div style={{ marginTop: '11px', color: 'var(--n-400)', fontSize: '12px' }}>
               DOB: ░░░░░░ &middot; restricted field
             </div>
           </div>
           <div className="actions">
-            <Btn text="Export Profile" kind="secondary" />
+            <Btn text="Export Profile" kind="secondary" onClick={() => exportJson(`${(entityDetail?.canonical_name || 'entity-profile').replace(/\s+/g, '-').toLowerCase()}.json`, { entity: entityDetail, cases: entityCases, network: networkGraph })} />
           </div>
         </div>
       </PanelBlock>
@@ -739,32 +1399,46 @@ export function App() {
           <PanelBlock label="CASE HISTORY" head="Case Involvements">
             <Table
               headers={['Case No.', 'Type', 'Role', 'Date']}
-              rows={[
-                ['CR-2024-04471', 'Robbery', 'Accused', 'Sep 2024'],
-                ['CR-2023-11201', 'Robbery', 'Accused', 'Nov 2023'],
-                ['CR-2022-07834', 'Theft', 'Accused', 'Apr 2022']
-              ]}
+              rows={(entityCases.length ? entityCases : cases).slice(0, 5).map((item) => [
+                item.case_number,
+                item.case_type,
+                selectedCase.entities?.find((entity) => entity.id === selectedEntityId)?.role || 'Linked',
+                shortDate(item.incident_date),
+              ])}
             />
           </PanelBlock>
           <PanelBlock label="ASK ABOUT THIS ENTITY">
             <div className="query-bar">
               <Ic name="mic" />
-              <input placeholder="Ask anything about Raju Kumar" />
-              <Ic name="send" />
+              <input
+                placeholder={`Ask anything about ${entityDetail?.canonical_name || 'Raju Kumar'}`}
+                value={entityQuestion}
+                onChange={(event) => setEntityQuestion(event.target.value)}
+                onKeyDown={(event) => {
+                  if (event.key === 'Enter') {
+                    void handleEntityQuestion(entityQuestion || `Summarize ${entityDetail?.canonical_name || 'this entity'}`);
+                    setEntityQuestion('');
+                  }
+                }}
+              />
+              <span onClick={() => {
+                void handleEntityQuestion(entityQuestion || `Summarize ${entityDetail?.canonical_name || 'this entity'}`);
+                setEntityQuestion('');
+              }}><Ic name="send" /></span>
             </div>
           </PanelBlock>
         </div>
         <div className="stack">
           <PanelBlock label="NETWORK PREVIEW" head="Mini Network">
-            <PlaceholderCanvas iconName="network" label="Mini Network" height="150px" />
+            <NetworkCanvas graph={networkGraph} selectedNodeId={selectedEntityId} onSelect={setSelectedNodeId} height="165px" compact />
             <div style={{ marginTop: '12px' }}>
-              <Btn text="Open Full Network &nearr;" kind="ghost" onClick={() => handleScreenChange('network')} />
+              <Btn text="Open Full Network ↗" kind="ghost" onClick={() => handleScreenChange('network')} />
             </div>
           </PanelBlock>
           <PanelBlock label="TIMELINE PREVIEW" head="Timeline Summary">
-            <PlaceholderCanvas iconName="map" label="Mini Timeline" height="110px" />
+            <TimelineCanvas events={timeline} height="125px" compact />
             <div style={{ marginTop: '12px' }}>
-              <Btn text="Open Full Timeline &nearr;" kind="ghost" onClick={() => handleScreenChange('timeline')} />
+              <Btn text="Open Full Timeline ↗" kind="ghost" onClick={() => handleScreenChange('timeline')} />
             </div>
           </PanelBlock>
         </div>
@@ -775,8 +1449,12 @@ export function App() {
   const renderEntityProfileRight = () => (
     <PanelBlock label="RELATED" head="Direct Connections">
       <div className="list">
-        <div className="list-item">Suresh M. <span style={{ color: 'var(--n-500)', fontSize: '11.5px' }}>Associate</span></div>
-        <div className="list-item">9880-XXXX <span style={{ color: 'var(--n-500)', fontSize: '11.5px' }}>Shared phone</span></div>
+        {(selectedCase.entities?.filter((entity) => entity.id !== selectedEntityId).length ? selectedCase.entities.filter((entity) => entity.id !== selectedEntityId) : [
+          { canonical_name: 'Suresh M.', role: 'Associate', id: 'suresh-m' },
+          { canonical_name: '9880-XXXX', role: 'Shared phone', id: 'phone' },
+        ]).map((entity) => (
+          <div className="list-item" key={entity.id}>{entity.canonical_name} <span style={{ color: 'var(--n-500)', fontSize: '11.5px' }}>{entity.role}</span></div>
+        ))}
       </div>
     </PanelBlock>
   );
@@ -785,23 +1463,25 @@ export function App() {
     <>
       <PanelBlock label="GRAPH TOOLBAR">
         <div className="filter-bar">
-          <span className="filter-chip"><Ic name="filter" cls="ic-sm" />Filter <Ic name="chevronDown" cls="ic-sm" /></span>
+          <button className="filter-chip" onClick={() => { setNetworkQuery(''); setSelectedNodeId(''); }}><Ic name="filter" cls="ic-sm" />All nodes</button>
           <div className="search-bar" style={{ flex: 1, minWidth: '200px' }}>
             <Ic name="search" />
-            <input placeholder="Find node" />
+            <input placeholder="Find node" value={networkQuery} onChange={(event) => setNetworkQuery(event.target.value)} />
           </div>
-          <Btn text="Fit" kind="ghost" />
-          <Btn text="" kind="ghost" extra={<Ic name="zoomIn" cls="ic-sm" />} />
-          <Btn text="" kind="ghost" extra={<Ic name="zoomOut" cls="ic-sm" />} />
-          <Btn text="Export" kind="secondary" extra={<Ic name="download" cls="ic-sm" />} />
+          <Btn text="Fit" kind="ghost" onClick={() => setGraphZoom(100)} />
+          <Btn text="" kind="ghost" aria-label="Zoom in network" title="Zoom in" extra={<Ic name="zoomIn" cls="ic-sm" />} onClick={() => setGraphZoom((value) => Math.min(160, value + 10))} />
+          <Btn text="" kind="ghost" aria-label="Zoom out network" title="Zoom out" extra={<Ic name="zoomOut" cls="ic-sm" />} onClick={() => setGraphZoom((value) => Math.max(60, value - 10))} />
+          <Btn text="Export" kind="secondary" extra={<Ic name="download" cls="ic-sm" />} onClick={() => exportJson(`${selectedCaseNumber}-network.json`, networkGraph)} />
         </div>
       </PanelBlock>
 
       <PanelBlock label="NETWORK GRAPH">
-        <PlaceholderCanvas
-          iconName="network"
-          label="Network Graph Canvas"
-          note="[Case:4471] — ACCUSED_IN — [Raju K] — ASSOCIATE — [Suresh M] — SHARES_PHONE — [Phone:9945]"
+        <NetworkCanvas
+          graph={networkGraph}
+          query={networkQuery}
+          zoom={graphZoom}
+          selectedNodeId={selectedNodeId}
+          onSelect={setSelectedNodeId}
           height="420px"
         />
       </PanelBlock>
@@ -817,20 +1497,26 @@ export function App() {
   const renderNetworkExplorerRight = () => (
     <>
       <PanelBlock label="SELECTED NODE" head="Node Details">
+        {(() => {
+          const node = networkGraph.nodes.find((item) => item.data.id === selectedNodeId) || networkGraph.nodes[1] || networkGraph.nodes[0] || FALLBACK_GRAPH.nodes[1];
+          return (
         <Kv rows={[
-          ['Name', 'Raju Kumar'],
-          ['Type', 'Person'],
-          ['Cases', '3'],
-          ['Aliases', '3']
+          ['Name', node.data.label],
+          ['Type', node.data.type || 'Entity'],
+          ['Cases', String(networkGraph.nodes.filter((item) => item.data.type === 'CASE').length || 1)],
+          ['Aliases', String(entityDetail?.aliases?.length || 0)]
         ]} />
+          );
+        })()}
       </PanelBlock>
       <PanelBlock label="RELATIONSHIPS" head="Links Summary">
         <div className="list">
-          <div className="list-item">ASSOCIATE_OF <span style={{ color: 'var(--n-500)', fontSize: '11.5px' }}>×2</span></div>
-          <div className="list-item">ACCUSED_IN <span style={{ color: 'var(--n-500)', fontSize: '11.5px' }}>×3</span></div>
+          {(networkGraph.edges.length ? networkGraph.edges : FALLBACK_GRAPH.edges).slice(0, 4).map((edge) => (
+            <div className="list-item" key={edge.data.id}>{edge.data.label || 'RELATED'} <span style={{ color: 'var(--n-500)', fontSize: '11.5px' }}>×1</span></div>
+          ))}
         </div>
         <div style={{ marginTop: '12px' }}>
-          <Btn text="View Profile &nearr;" kind="secondary" onClick={() => handleScreenChange('entity')} />
+          <Btn text="View Profile ↗" kind="secondary" onClick={() => handleScreenChange('entity')} />
         </div>
       </PanelBlock>
     </>
@@ -840,42 +1526,28 @@ export function App() {
     <>
       <PanelBlock label="TIMELINE TOOLBAR">
         <div className="filter-bar">
-          <span className="filter-chip">Date Range <Ic name="chevronDown" cls="ic-sm" /></span>
-          <Btn text="Zoom In" kind="ghost" extra={<Ic name="zoomIn" cls="ic-sm" />} />
-          <Btn text="Zoom Out" kind="ghost" extra={<Ic name="zoomOut" cls="ic-sm" />} />
-          <Btn text="Export" kind="secondary" extra={<Ic name="download" cls="ic-sm" />} />
+          <button className="filter-chip" onClick={() => setTimelineZoom(100)}>Reset view</button>
+          <Btn text="Zoom In" kind="ghost" extra={<Ic name="zoomIn" cls="ic-sm" />} onClick={() => setTimelineZoom((value) => Math.min(160, value + 10))} />
+          <Btn text="Zoom Out" kind="ghost" extra={<Ic name="zoomOut" cls="ic-sm" />} onClick={() => setTimelineZoom((value) => Math.max(70, value - 10))} />
+          <Btn text="Export" kind="secondary" extra={<Ic name="download" cls="ic-sm" />} onClick={() => exportJson(`${selectedCaseNumber}-timeline.json`, timeline)} />
         </div>
       </PanelBlock>
 
       <PanelBlock label="TIMELINE">
-        <PlaceholderCanvas
-          iconName="map"
-          label="Timeline Axis"
-          note="Sep 2024 — 15-Sep Incident reported · 18-Sep Suspect identified · 22-Sep conflicting location evidence · 30-Sep Arrest"
-          height="260px"
-        />
+        <TimelineCanvas events={timeline} zoom={timelineZoom} height="280px" />
       </PanelBlock>
 
       <PanelBlock label="EVENTS" head="Incidents Ledger">
         <div className="list">
-          <div className="list-item">
-            <span>15-Sep — Incident reported, Koramangala</span>
-            <span className="source-chip">FIR</span>
-          </div>
-          <div className="list-item">
-            <span>18-Sep — Suspect Raju K. identified</span>
-            <span className="source-chip">Witness Stmt</span>
-          </div>
-          <div className="list-item">
-            <span>
-              <span className="conflict-flag" style={{ marginRight: '8px' }}>!</span>22-Sep — Conflicting location evidence
-            </span>
-            <span className="source-chip">CDR + Witness</span>
-          </div>
-          <div className="list-item">
-            <span>30-Sep — Arrest made</span>
-            <span className="source-chip">Case Diary</span>
-          </div>
+          {timeline.map((event) => (
+            <div className="list-item" key={event.id}>
+              <span>
+                {event.has_conflict && <span className="conflict-flag" style={{ marginRight: '8px' }}>!</span>}
+                {shortDate(event.event_date)} — {event.description}
+              </span>
+              <span className="source-chip">{event.event_type.replace(/_/g, ' ')}</span>
+            </div>
+          ))}
         </div>
       </PanelBlock>
     </>
@@ -883,12 +1555,17 @@ export function App() {
 
   const renderTimelineRight = () => (
     <PanelBlock label="EVENT DETAIL" head="Specific Fact Info">
+      {(() => {
+        const event = timeline.find((item) => item.has_conflict) || timeline[0] || FALLBACK_TIMELINE[0];
+        return (
       <Kv rows={[
-        ['Date', '22-Sep-2024'],
-        ['Source', 'Phone CDR'],
-        ['Confidence', 'High'],
-        ['Linked Case', 'CR-2024-04471']
+        ['Date', shortDate(event.event_date)],
+        ['Source', event.event_type.replace(/_/g, ' ')],
+        ['Confidence', event.has_conflict ? 'Review needed' : 'High'],
+        ['Linked Case', selectedCaseNumber]
       ]} />
+        );
+      })()}
     </PanelBlock>
   );
 
@@ -896,18 +1573,22 @@ export function App() {
     <>
       <PanelBlock label="MAP TOOLBAR">
         <div className="filter-bar">
-          <span className="filter-chip">Date Range <Ic name="chevronDown" cls="ic-sm" /></span>
-          <span className="filter-chip">Incident Type <Ic name="chevronDown" cls="ic-sm" /></span>
-          <span className="filter-chip">District <Ic name="chevronDown" cls="ic-sm" /></span>
-          <Btn text="Export" kind="secondary" extra={<Ic name="download" cls="ic-sm" />} />
+          <button className={`filter-chip ${mapTypeFilter === '' ? 'active' : ''}`} onClick={() => setMapTypeFilter('')}>All types</button>
+          <button className={`filter-chip ${mapTypeFilter === 'Robbery' ? 'active' : ''}`} onClick={() => setMapTypeFilter('Robbery')}>Robbery</button>
+          <button className={`filter-chip ${mapStatusFilter === 'ACTIVE' ? 'active' : ''}`} onClick={() => setMapStatusFilter(mapStatusFilter === 'ACTIVE' ? '' : 'ACTIVE')}>Active only</button>
+          <Btn text="Refresh" kind="ghost" onClick={() => void refreshAll()} />
+          <Btn text="Export" kind="secondary" extra={<Ic name="download" cls="ic-sm" />} onClick={() => exportJson('crime-map-data.json', { incidents: mapIncidents, hotspots })} />
         </div>
       </PanelBlock>
 
       <PanelBlock label="CRIME MAP">
-        <PlaceholderCanvas
-          iconName="map"
-          label="Map Canvas"
-          note="Incident markers and hotspot heat-zone overlay render here (Leaflet + OpenStreetMap)"
+        <CrimeMapCanvas
+          incidents={mapIncidents}
+          cases={cases}
+          hotspots={hotspots}
+          layers={mapLayers}
+          typeFilter={mapTypeFilter}
+          statusFilter={mapStatusFilter}
           height="440px"
         />
       </PanelBlock>
@@ -918,9 +1599,9 @@ export function App() {
     <>
       <PanelBlock label="LAYER TOGGLES" head="Operational Layers">
         <div className="list">
-          <div className="list-item">Incidents <span style={{ color: 'var(--n-500)' }}>On</span></div>
-          <div className="list-item">Hotspots <span style={{ color: 'var(--n-500)' }}>On</span></div>
-          <div className="list-item">Station Boundaries <span style={{ color: 'var(--n-400)' }}>Off</span></div>
+          <div className="list-item" onClick={() => setMapLayers((prev) => ({ ...prev, incidents: !prev.incidents }))}>Incidents <span style={{ color: 'var(--n-500)' }}>{mapLayers.incidents ? 'On' : 'Off'}</span></div>
+          <div className="list-item" onClick={() => setMapLayers((prev) => ({ ...prev, hotspots: !prev.hotspots }))}>Hotspots <span style={{ color: 'var(--n-500)' }}>{mapLayers.hotspots ? 'On' : 'Off'}</span></div>
+          <div className="list-item" onClick={() => setMapLayers((prev) => ({ ...prev, boundaries: !prev.boundaries }))}>Station Boundaries <span style={{ color: mapLayers.boundaries ? 'var(--n-500)' : 'var(--n-400)' }}>{mapLayers.boundaries ? 'On' : 'Off'}</span></div>
         </div>
       </PanelBlock>
       <PanelBlock label="HOTSPOT ALERT">
@@ -929,47 +1610,49 @@ export function App() {
           <Badge text="HIGH" kind="critical" />
         </div>
         <div style={{ fontSize: '12.5px', color: 'var(--n-600)', marginBottom: '10px' }}>
-          +40% incidents this week
+          {hotspots.length ? `${Math.round(Math.max(...hotspots.map((item) => item.intensity)) * 100)}% hotspot intensity` : '+40% incidents this week'}
         </div>
         <Confidence n={4} labelText="High confidence" />
         <div style={{ marginTop: '12px' }}>
-          <Btn text="Investigate &nearr;" kind="secondary" onClick={() => handleScreenChange('workspace')} />
+          <Btn text="Investigate ↗" kind="secondary" onClick={() => handleScreenChange('workspace')} />
         </div>
       </PanelBlock>
     </>
   );
 
   const renderReportsView = () => (
-    <PanelBlock label="REPORTS">
-      <Table
-        headers={['Title', 'Case No.', 'Status', 'Created By', 'Date', '']}
-        rows={[
-          [
-            'Cross-case MO summary',
-            'CR-2024-04471',
-            <Badge text="GENERATED" kind="success" />,
-            'S. Ravi Kumar',
-            '02-Jul-2026',
-            <Btn text="Download" kind="ghost" extra={<Ic name="download" cls="ic-sm" />} />
-          ],
-          [
-            'Network analysis brief',
-            'CR-2024-04471',
-            <Badge text="DRAFT" kind="neutral" />,
-            'S. Ravi Kumar',
-            '01-Jul-2026',
-            <Btn text="Continue" kind="ghost" />
-          ]
-        ]}
-      />
-      <Pagination text="Showing 1–2 of 2 reports" />
-    </PanelBlock>
+    <>
+      <PanelBlock label="REPORT ACTIONS">
+        <div className="filter-bar">
+          <Btn text="New Report" kind="primary" extra={<Ic name="plus" cls="ic-sm" />} onClick={() => void handleCreateReport()} />
+          <Btn text="Refresh" kind="ghost" onClick={() => void refreshAll()} />
+          <Btn text="Export List" kind="secondary" extra={<Ic name="download" cls="ic-sm" />} onClick={() => exportJson('reports.json', reports)} />
+        </div>
+      </PanelBlock>
+      <PanelBlock label="REPORTS">
+        <Table
+          headers={['Title', 'Case No.', 'Status', 'Created By', 'Date', '']}
+          rows={(reports.length ? reports : [
+            { id: 'fallback-report-1', title: 'Cross-case MO summary', case_id: selectedCase.id, status: 'GENERATED', created_by: currentUser?.full_name || 'S. Ravi Kumar', created_at: '2026-07-02' },
+            { id: 'fallback-report-2', title: 'Network analysis brief', case_id: selectedCase.id, status: 'DRAFT', created_by: currentUser?.full_name || 'S. Ravi Kumar', created_at: '2026-07-01' },
+          ]).map((report) => [
+            report.title,
+            cases.find((item) => item.id === report.case_id)?.case_number || selectedCaseNumber,
+            <Badge key={`${report.id}-status`} text={report.status} kind={statusKind(report.status)} />,
+            report.created_by || currentUser?.full_name || '—',
+            shortDate(report.created_at),
+            <Btn key={`${report.id}-action`} text={report.status === 'DRAFT' ? 'Continue' : 'Download'} kind="ghost" extra={report.status === 'DRAFT' ? undefined : <Ic name="download" cls="ic-sm" />} onClick={() => report.status === 'DRAFT' ? handleScreenChange('workspace') : void handleReportDownload(report)} />
+          ])}
+        />
+        <Pagination text={`Showing 1–${Math.max(1, reports.length || 2)} of ${Math.max(1, reports.length || 2)} reports`} />
+      </PanelBlock>
+    </>
   );
 
   const renderReportsRight = () => (
     <PanelBlock label="IN PROGRESS" head="Active Generation">
       <div style={{ fontSize: '12.5px', color: 'var(--n-600)', marginBottom: '12px' }}>
-        Network analysis brief — compiling sourced findings&hellip;
+        {(reports.find((report) => report.status === 'DRAFT')?.title || 'Network analysis brief')} — compiling sourced findings&hellip;
       </div>
       <div style={{ height: '8px', borderRadius: '4px', background: 'var(--n-200)', overflow: 'hidden' }}>
         <div style={{ width: '62%', height: '100%', background: 'var(--navy-600)' }}></div>
@@ -977,43 +1660,48 @@ export function App() {
     </PanelBlock>
   );
 
-  const renderAlertsView = () => (
-    <>
-      <PanelBlock label="FILTERS">
-        <div className="filter-bar">
-          <span className="filter-chip">Severity <Ic name="chevronDown" cls="ic-sm" /></span>
-          <span className="filter-chip">District <Ic name="chevronDown" cls="ic-sm" /></span>
-          <span className="filter-chip">Status <Ic name="chevronDown" cls="ic-sm" /></span>
-        </div>
-      </PanelBlock>
-      <div className="card">
-        <div className="card-head">
-          <h4>Hotspot threshold crossed — Whitefield</h4>
-          <Badge text="HIGH" kind="critical" />
-        </div>
-        <div style={{ fontSize: '12.5px', color: 'var(--n-600)', marginBottom: '9px' }}>
-          +40% incidents vs. 4-week baseline
-        </div>
-        <Confidence n={4} />
-        <div style={{ marginTop: '10px' }}>
-          <Btn text="Acknowledge" kind="ghost" />
-        </div>
-      </div>
-      <div className="card">
-        <div className="card-head">
-          <h4>Pattern spike — cross-case MO match</h4>
-          <Badge text="MEDIUM" kind="warning" />
-        </div>
-        <div style={{ fontSize: '12.5px', color: 'var(--n-600)', marginBottom: '9px' }}>
-          3 cases matched in 14 days
-        </div>
-        <Confidence n={3} />
-        <div style={{ marginTop: '10px' }}>
-          <Btn text="Acknowledge" kind="ghost" />
-        </div>
-      </div>
-    </>
-  );
+  const renderAlertsView = () => {
+    const alertRows = (alerts.length ? alerts : [
+      { id: 'fallback-alert-1', alert_type: 'HOTSPOT', severity: 'HIGH', title: 'Hotspot threshold crossed — Whitefield', description: '+40% incidents vs. 4-week baseline', confidence_tier: 'High' },
+      { id: 'fallback-alert-2', alert_type: 'PATTERN', severity: 'MEDIUM', title: 'Pattern spike — cross-case MO match', description: '3 cases matched in 14 days', confidence_tier: 'Moderate' },
+    ]).filter((alert) => !alertSeverityFilter || alert.severity === alertSeverityFilter);
+
+    return (
+      <>
+        <PanelBlock label="FILTERS">
+          <div className="filter-bar">
+            <button className={`filter-chip ${alertSeverityFilter === '' ? 'active' : ''}`} onClick={() => setAlertSeverityFilter('')}>All severity</button>
+            <button className={`filter-chip ${alertSeverityFilter === 'HIGH' ? 'active' : ''}`} onClick={() => setAlertSeverityFilter('HIGH')}>High</button>
+            <button className={`filter-chip ${alertSeverityFilter === 'MEDIUM' ? 'active' : ''}`} onClick={() => setAlertSeverityFilter('MEDIUM')}>Medium</button>
+            <Btn text="Refresh" kind="ghost" onClick={() => void refreshAll()} />
+          </div>
+        </PanelBlock>
+        {alertRows.map((alert) => (
+          <div className="card" key={alert.id}>
+            <div className="card-head">
+              <h4>{alert.title}</h4>
+              <Badge text={alert.severity} kind={statusKind(alert.severity)} />
+            </div>
+            <div style={{ fontSize: '12.5px', color: 'var(--n-600)', marginBottom: '9px' }}>
+              {alert.description || alert.alert_type}
+            </div>
+            <Confidence n={confidenceDots(alert.confidence_tier)} />
+            <div style={{ marginTop: '10px' }}>
+              <Btn text={alert.acknowledged_at ? 'Acknowledged' : 'Acknowledge'} kind="ghost" disabled={!!alert.acknowledged_at} onClick={async () => {
+                if (alert.id.startsWith('fallback')) {
+                  setToast('Fallback alert acknowledged locally');
+                  return;
+                }
+                const updated = await api.acknowledgeAlert(alert.id);
+                setAlerts((prev) => prev.map((item) => item.id === alert.id ? updated : item));
+                setToast('Alert acknowledged');
+              }} />
+            </div>
+          </div>
+        ))}
+      </>
+    );
+  };
 
   const renderAlertsRight = () => (
     <>
@@ -1032,6 +1720,16 @@ export function App() {
   );
 
   const renderAdminView = () => {
+    const users = adminUsers.length ? adminUsers : [
+      { id: 'fallback-u1', full_name: 'S. Ravi Kumar', badge_number: 'KSP-44210', role: 'SI', rank: 'SI', station_id: 'Koramangala PS', district_id: null },
+      { id: 'fallback-u2', full_name: 'A. Prakash', badge_number: 'KSP-33019', role: 'INSPECTOR', rank: 'INSPECTOR', station_id: 'Whitefield PS', district_id: null },
+      { id: 'fallback-u3', full_name: 'M. Lakshmi', badge_number: 'KSP-51002', role: 'ANALYST', rank: 'ANALYST', station_id: 'SCRB', district_id: null },
+    ] as ApiUser[];
+    const auditRows = auditEvents.length ? auditEvents : [
+      { id: 'fallback-a1', created_at: '2026-07-02T14:02:00Z', user_id: 'S. Ravi Kumar', event_type: 'QUERY', action: 'Cross-case MO similarity check' },
+      { id: 'fallback-a2', created_at: '2026-07-02T14:02:00Z', user_id: 'System', event_type: 'RESPONSE', action: 'Logged' },
+    ] as AuditEvent[];
+
     return renderTabsBlock(
       'admin-tabs',
       ['Users', 'Roles & Access', 'Audit Log'],
@@ -1040,15 +1738,18 @@ export function App() {
           <PanelBlock label="USER MANAGEMENT">
             <Table
               headers={['Name', 'Badge No.', 'Role', 'Station', 'Status', '']}
-              rows={[
-                ['S. Ravi Kumar', 'KSP-44210', <Badge text="SI" kind="neutral" />, 'Koramangala PS', <Badge text="ACTIVE" kind="success" />, <Btn text="Edit" kind="ghost" />],
-                ['A. Prakash', 'KSP-33019', <Badge text="INSPECTOR" kind="neutral" />, 'Whitefield PS', <Badge text="ACTIVE" kind="success" />, <Btn text="Edit" kind="ghost" />],
-                ['M. Lakshmi', 'KSP-51002', <Badge text="ANALYST" kind="neutral" />, 'SCRB', <Badge text="ACTIVE" kind="success" />, <Btn text="Edit" kind="ghost" />]
-              ]}
+              rows={users.map((user) => [
+                user.full_name,
+                user.badge_number,
+                <Badge key={`${user.id}-role`} text={user.role} kind="neutral" />,
+                user.station_id || user.district_id || '—',
+                <Badge key={`${user.id}-status`} text="ACTIVE" kind="success" />,
+                <Btn key={`${user.id}-edit`} text="Edit" kind="ghost" onClick={() => user.id.startsWith('fallback') ? setToast('Login as ADMIN to edit live users') : void handleEditUser(user)} />
+              ])}
             />
           </PanelBlock>
           <div style={{ marginTop: '14px' }}>
-            <Btn text="Add User" kind="primary" extra={<Ic name="plus" cls="ic-sm" />} />
+            <Btn text="Add User" kind="primary" extra={<Ic name="plus" cls="ic-sm" />} onClick={() => void handleAddUser()} />
           </div>
         </div>,
         <PanelBlock label="ROLE DEFINITIONS" key="roles">
@@ -1062,11 +1763,12 @@ export function App() {
         <PanelBlock label="AUDIT LOG" key="logs">
           <Table
             headers={['Timestamp', 'User', 'Event', 'Detail']}
-            rows={[
-              ['02-Jul-2026 14:02', 'S. Ravi Kumar', 'QUERY', 'Cross-case MO similarity check'],
-              ['02-Jul-2026 14:02', 'System', 'RESPONSE', <Badge text="LOGGED" kind="success" />],
-              ['01-Jul-2026 09:41', 'M. Lakshmi', 'LOGIN', '—']
-            ]}
+            rows={auditRows.map((event) => [
+              shortDate(event.created_at || event.timestamp),
+              event.user_id || 'System',
+              event.event_type,
+              event.action || event.resource_type || <Badge key={`${event.id}-logged`} text="LOGGED" kind="success" />
+            ])}
           />
         </PanelBlock>
       ]
@@ -1087,7 +1789,7 @@ export function App() {
       <PanelBlock label="LANGUAGE PREFERENCE">
         <div className="field">
           <label>Default Language</label>
-          <select className="input">
+          <select className="input" value={settings.language} onChange={(event) => setSettings((prev) => ({ ...prev, language: event.target.value }))}>
             <option>English</option>
             <option>ಕನ್ನಡ (Kannada)</option>
           </select>
@@ -1096,7 +1798,7 @@ export function App() {
       <PanelBlock label="DISPLAY DENSITY">
         <div className="field">
           <label>Table &amp; List Density</label>
-          <select className="input">
+          <select className="input" value={settings.density} onChange={(event) => setSettings((prev) => ({ ...prev, density: event.target.value }))}>
             <option>Comfortable</option>
             <option>Compact</option>
           </select>
@@ -1104,20 +1806,21 @@ export function App() {
       </PanelBlock>
       <PanelBlock label="NOTIFICATION PREFERENCES">
         <div className="list">
-          <div className="list-item">Hotspot alerts <span style={{ color: 'var(--n-500)' }}>On</span></div>
-          <div className="list-item">New cross-case matches <span style={{ color: 'var(--n-500)' }}>On</span></div>
-          <div className="list-item">Weekly summary email <span style={{ color: 'var(--n-400)' }}>Off</span></div>
+          <div className="list-item" onClick={() => setSettings((prev) => ({ ...prev, hotspotAlerts: !prev.hotspotAlerts }))}>Hotspot alerts <span style={{ color: 'var(--n-500)' }}>{settings.hotspotAlerts ? 'On' : 'Off'}</span></div>
+          <div className="list-item" onClick={() => setSettings((prev) => ({ ...prev, matchAlerts: !prev.matchAlerts }))}>New cross-case matches <span style={{ color: 'var(--n-500)' }}>{settings.matchAlerts ? 'On' : 'Off'}</span></div>
+          <div className="list-item">Current API <span style={{ color: 'var(--n-500)' }}>{apiStatus === 'ready' ? 'Connected' : apiStatus}</span></div>
         </div>
       </PanelBlock>
-      <Btn text="Save Changes" kind="primary" />
+      <div className="filter-bar">
+        <Btn text="Save Changes" kind="primary" onClick={handleSaveSettings} />
+        <Btn text="Sign Out" kind="secondary" onClick={handleLogout} />
+      </div>
     </>
   );
 
   // Selector for current view
   const renderScreenContent = () => {
     switch (currentScreen) {
-      case 'legend':
-        return renderLegendView();
       case 'login':
         return renderLoginView();
       case 'workspace':
@@ -1143,7 +1846,7 @@ export function App() {
       case 'settings':
         return renderSettingsView();
       default:
-        return renderLegendView();
+        return getStoredToken() ? renderWorkspaceView() : renderLoginView();
     }
   };
 
@@ -1189,7 +1892,7 @@ export function App() {
         <div className="hamburger" onClick={() => setNavOpen(!navOpen)}>
           <Ic name="menu" />
         </div>
-        <div className="brand" onClick={() => handleScreenChange('legend')} style={{ cursor: 'pointer' }}>
+        <div className="brand" onClick={() => handleScreenChange('workspace')} style={{ cursor: 'pointer' }}>
           <img className="crest" src={CREST_SRC} alt="Karnataka State Police crest" />
           <div className="brand-text">
             <span className="brand-name">KSP Crime Intelligence Platform</span>
@@ -1219,9 +1922,9 @@ export function App() {
             <span className="badge-dot">3</span>
           </div>
           <div className="profile-menu" onClick={() => handleScreenChange('settings')}>
-            <span className="avatar">SR</span>
+            <span className="avatar">{(currentUser?.full_name || 'S. Ravi Kumar').split(' ').map((part) => part[0]).slice(0, 2).join('')}</span>
             <span className="who">
-              S. Ravi Kumar<b>Sub-Inspector</b>
+              {currentUser?.full_name || 'S. Ravi Kumar'}<b>{currentUser?.rank || currentUser?.role || 'Sub-Inspector'}</b>
             </span>
             <Ic name="chevronDown" cls="ic-sm" />
           </div>
@@ -1260,33 +1963,11 @@ export function App() {
 
   return (
     <div>
-      {/* Meta Navigator */}
-      <nav id="meta">
-        <span className="meta-title">Hi-Fi Reference</span>
-        {SCREENS.map((scr, idx) => (
-          <button
-            key={idx}
-            className={`scr-btn ${currentScreen === scr.key ? 'on' : ''}`}
-            onClick={() => handleScreenChange(scr.key)}
-          >
-            {scr.navLabel}
-          </button>
-        ))}
-        <div className="meta-spacer"></div>
-        <button
-          id="annot-toggle"
-          className={showAnnotations ? 'on' : ''}
-          onClick={() => setShowAnnotations(!showAnnotations)}
-        >
-          Annotations: {showAnnotations ? 'On' : 'Off'}
-        </button>
-      </nav>
-
       {/* Main App Container */}
       <div id="root">
         {activeConf.shell ? (
           <div className="app-shell">
-            {renderHeader(activeConf.caseLabel)}
+            {renderHeader(selectedCaseNumber)}
             <div className="app-body">
               <div className={`scrim ${navOpen || panelOpen ? 'show' : ''}`} onClick={closeOverlays}></div>
               {renderNav(activeConf.activeNav)}
@@ -1326,6 +2007,7 @@ export function App() {
           renderScreenContent()
         )}
       </div>
+      {toast && <div className="toast" role="status">{toast}</div>}
     </div>
   );
 }
