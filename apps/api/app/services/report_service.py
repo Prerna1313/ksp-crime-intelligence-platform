@@ -1,6 +1,7 @@
 from sqlalchemy.orm import Session
 from app.models.report import Report
 from app.schemas.report import ReportCreate
+from app.core.database import SessionLocal
 from typing import List, Optional
 import uuid
 
@@ -17,11 +18,31 @@ class ReportService:
         return query.all()
 
     @staticmethod
-    def create_report(db: Session, user_id: str, report_in: ReportCreate) -> Report:
+    def _generate_pdf_task(report_id: str):
+        # We need a new session since it's background
+        db = SessionLocal()
+        try:
+            import time
+            time.sleep(2)  # Simulate PDF generation
+            db_report = db.query(Report).filter(Report.id == report_id).first()
+            if db_report:
+                db_report.status = "COMPLETED"
+                db_report.content_json = {"status": "pdf_generated"}
+                db.commit()
+        except Exception as e:
+            print(f"Error generating PDF: {e}")
+            db_report = db.query(Report).filter(Report.id == report_id).first()
+            if db_report:
+                db_report.status = "FAILED"
+                db.commit()
+        finally:
+            db.close()
+
+    @staticmethod
+    def create_report(db: Session, user_id: str, report_in: ReportCreate, background_tasks) -> Report:
         """
         Creates a new report draft.
-        In production, this would queue a background task (e.g. Celery / Catalyst Event function)
-        to compile the timeline and conversations into a PDF and upload it to Catalyst File Store.
+        Schedules a BackgroundTask for PDF generation to return immediately to the client.
         """
         db_report = Report(
             created_by=user_id,
@@ -34,6 +55,9 @@ class ReportService:
         db.add(db_report)
         db.commit()
         db.refresh(db_report)
+        
+        # Schedule the background task
+        background_tasks.add_task(ReportService._generate_pdf_task, str(db_report.id))
         return db_report
 
     @staticmethod

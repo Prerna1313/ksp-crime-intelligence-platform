@@ -1,4 +1,4 @@
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, status, BackgroundTasks
 from sqlalchemy.orm import Session
 from app.core.database import get_db
 from app.core.dependencies import get_current_user
@@ -17,19 +17,20 @@ async def list_reports(
     reports = ReportService.list_reports(db, user_id=user.id)
     return {
         "status": "success", 
-        "data": [ReportResponse.from_attributes(r) for r in reports]
+        "data": [ReportResponse.model_validate(r) for r in reports]
     }
 
 @router.post("/", response_model=StandardResponse, status_code=status.HTTP_201_CREATED)
 async def create_report(
     request: ReportCreate, 
+    background_tasks: BackgroundTasks,
     db: Session = Depends(get_db), 
     user: User = Depends(get_current_user)
 ):
-    report = ReportService.create_report(db, user_id=user.id, report_in=request)
+    report = ReportService.create_report(db, user_id=user.id, report_in=request, background_tasks=background_tasks)
     return {
         "status": "success", 
-        "data": ReportResponse.from_attributes(report)
+        "data": ReportResponse.model_validate(report)
     }
 
 @router.get("/{report_id}", response_model=StandardResponse)
@@ -43,7 +44,7 @@ async def get_report_detail(
         raise HTTPException(status_code=404, detail="Report not found")
     return {
         "status": "success", 
-        "data": ReportResponse.from_attributes(report)
+        "data": ReportResponse.model_validate(report)
     }
 
 @router.get("/{report_id}/download")

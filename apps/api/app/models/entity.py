@@ -11,7 +11,7 @@ class Entity(Base):
     entity_type = Column(String(50), nullable=False)
     neo4j_node_id = Column(String(100))
     created_at = Column(DateTime, server_default=text("CURRENT_TIMESTAMP"))
-    updated_at = Column(DateTime, server_default=text("CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP"))
+    updated_at = Column(DateTime, server_default=text("CURRENT_TIMESTAMP"))
 
     aliases = relationship("EntityAlias", back_populates="entity", cascade="all, delete-orphan")
     case_links = relationship("CaseEntityLink", back_populates="entity")

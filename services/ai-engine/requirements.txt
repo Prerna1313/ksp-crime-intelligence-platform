@@ -1,6 +1,6 @@
-fastapi==0.109.2
-uvicorn==0.27.1
-langchain==0.1.7
-langgraph==0.0.25
-pydantic==2.6.1
+fastapi>=0.109.2
+uvicorn>=0.27.1
+langchain>=0.1.7
+langgraph>=0.0.25
+pydantic>=2.9.2
 zcatalyst-sdk>=1.0.0

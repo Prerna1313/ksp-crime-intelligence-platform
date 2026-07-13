@@ -17,7 +17,7 @@ class Case(Base):
     incident_address = Column(Text)
     narrative = Column(Text)
     created_at = Column(DateTime, server_default=text("CURRENT_TIMESTAMP"))
-    updated_at = Column(DateTime, server_default=text("CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP"))
+    updated_at = Column(DateTime, server_default=text("CURRENT_TIMESTAMP"))
 
     station = relationship("Station", back_populates="cases")
     assigned_officer = relationship("User")

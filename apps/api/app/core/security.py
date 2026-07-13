@@ -8,8 +8,7 @@ from passlib.context import CryptContext
 import zcatalyst_sdk
 from app.core.config import settings
 
-# CryptContext for password hashing
-pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+import bcrypt
 
 # Bearer token security
 security = HTTPBearer()
@@ -30,13 +29,17 @@ def get_password_hash(password: str) -> str:
     """
     Generate a bcrypt hash of the password.
     """
-    return pwd_context.hash(password)
+    salt = bcrypt.gensalt()
+    pwd_bytes = password.encode('utf-8')
+    return bcrypt.hashpw(pwd_bytes, salt).decode('utf-8')
 
 def verify_password(plain_password: str, hashed_password: str) -> bool:
     """
     Verify a plain password against the stored bcrypt hash.
     """
-    return pwd_context.verify(plain_password, hashed_password)
+    pwd_bytes = plain_password.encode('utf-8')
+    hash_bytes = hashed_password.encode('utf-8')
+    return bcrypt.checkpw(pwd_bytes, hash_bytes)
 
 def create_access_token(data: dict, expires_delta: Optional[timedelta] = None) -> str:
     """

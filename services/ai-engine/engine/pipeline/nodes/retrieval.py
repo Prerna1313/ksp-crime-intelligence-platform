@@ -1,8 +1,8 @@
 from engine.pipeline.state import InvestigationState
-from engine.retrieval.rag_interface import PlaceholderRAGService
+from engine.retrieval.rag_interface import SQLiteRAGService
 
 # Instantiate abstract retrieval provider
-rag_service = PlaceholderRAGService()
+rag_service = SQLiteRAGService()
 
 def retrieve_evidence(state: InvestigationState) -> InvestigationState:
     """

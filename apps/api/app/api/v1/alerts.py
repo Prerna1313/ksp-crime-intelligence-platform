@@ -25,7 +25,7 @@ async def list_alerts(
     alerts = AlertService.list_alerts(db, district_id=district_id, station_id=station_id)
     return {
         "status": "success", 
-        "data": [AlertResponse.from_attributes(a) for a in alerts]
+        "data": [AlertResponse.model_validate(a) for a in alerts]
     }
 
 @router.get("/{alert_id}", response_model=StandardResponse)
@@ -39,7 +39,7 @@ async def get_alert_detail(
         raise HTTPException(status_code=404, detail="Alert not found")
     return {
         "status": "success", 
-        "data": AlertResponse.from_attributes(alert)
+        "data": AlertResponse.model_validate(alert)
     }
 
 @router.patch("/{alert_id}/acknowledge", response_model=StandardResponse)
@@ -53,6 +53,6 @@ async def acknowledge_alert(
         raise HTTPException(status_code=404, detail="Alert not found")
     return {
         "status": "success", 
-        "data": AlertResponse.from_attributes(alert)
+        "data": AlertResponse.model_validate(alert)
     }
 

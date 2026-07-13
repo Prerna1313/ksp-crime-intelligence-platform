@@ -23,7 +23,7 @@ async def list_cases(
     cases = CaseService.list_active_cases(db, skip=skip, limit=limit, station_id=station_id)
     return {
         "status": "success", 
-        "data": [CaseResponse.from_attributes(c) for c in cases]
+        "data": [CaseResponse.model_validate(c) for c in cases]
     }
 
 @router.get("/{case_id}", response_model=StandardResponse)

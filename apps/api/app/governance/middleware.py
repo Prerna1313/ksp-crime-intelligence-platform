@@ -66,10 +66,14 @@ class GovernanceMiddleware(BaseHTTPMiddleware):
                 data = annotate_confidence(data)
 
                 # 3. Post-response audit
+                response_content = json.dumps(data)
+                if len(response_content) > 10000:
+                    response_content = response_content[:10000] + "... [TRUNCATED DUE TO SIZE]"
+                    
                 await emit_audit_event(
                     event_type="RESPONSE",
                     request=request,
-                    content=json.dumps(data),
+                    content=response_content,
                     request_audit_id=request_audit_id
                 )
 

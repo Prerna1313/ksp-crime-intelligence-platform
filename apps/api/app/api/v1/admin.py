@@ -27,7 +27,7 @@ async def list_users(
     users = UserService.list_users(db, skip=skip, limit=limit)
     return {
         "status": "success", 
-        "data": [UserResponse.from_attributes(u) for u in users]
+        "data": [UserResponse.model_validate(u) for u in users]
     }
 
 @router.post("/users", response_model=StandardResponse, status_code=status.HTTP_201_CREATED)
@@ -44,7 +44,7 @@ async def create_user(
     new_user = UserService.create_user(db, request)
     return {
         "status": "success", 
-        "data": UserResponse.from_attributes(new_user)
+        "data": UserResponse.model_validate(new_user)
     }
 
 @router.patch("/users/{user_id}", response_model=StandardResponse)
@@ -59,7 +59,7 @@ async def update_user(
         raise HTTPException(status_code=404, detail="User not found")
     return {
         "status": "success", 
-        "data": UserResponse.from_attributes(updated)
+        "data": UserResponse.model_validate(updated)
     }
 
 @router.delete("/users/{user_id}", status_code=status.HTTP_204_NO_CONTENT)
@@ -94,7 +94,7 @@ async def list_audit_logs(
     )
     return {
         "status": "success", 
-        "data": [AuditEventResponse.from_attributes(l) for l in logs]
+        "data": [AuditEventResponse.model_validate(l) for l in logs]
     }
 
 @router.get("/audit/{audit_id}", response_model=StandardResponse)
@@ -108,6 +108,6 @@ async def get_audit_log_detail(
         raise HTTPException(status_code=404, detail="Audit event not found")
     return {
         "status": "success", 
-        "data": AuditEventResponse.from_attributes(event)
+        "data": AuditEventResponse.model_validate(event)
     }
 

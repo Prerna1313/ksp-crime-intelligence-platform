@@ -16,7 +16,7 @@ async def search_entities(
     user=Depends(get_current_user)
 ):
     entities = EntityService.search_entities(db, q)
-    return {"status": "success", "data": [EntityResponse.from_attributes(e) for e in entities]}
+    return {"status": "success", "data": [EntityResponse.model_validate(e) for e in entities]}
 
 @router.get("/resolve", response_model=StandardResponse)
 async def resolve_entities(
@@ -58,7 +58,7 @@ async def get_entity_cases(
     user=Depends(get_current_user)
 ):
     cases = EntityService.get_entity_cases(db, entity_id)
-    return {"status": "success", "data": [CaseResponse.from_attributes(c) for c in cases]}
+    return {"status": "success", "data": [CaseResponse.model_validate(c) for c in cases]}
 
 @router.get("/{entity_id}/network", response_model=StandardResponse)
 async def get_entity_network(
